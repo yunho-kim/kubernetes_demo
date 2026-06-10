@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# cvebench — Defects4J-style harness for the Kubernetes CVE reproduction lab.
+#
+# Subcommands:
+#   pids                                  list every CVE project ID
+#   bids       -p <pid>                   list bug IDs for a CVE (always "1")
+#   info       -p <pid> [-b <bid>]        print full metadata
+#   export     -p <pid> -q <prop>         dump one property (scripting use)
+#   checkout   -p <pid> -v <buggy|fixed> -w <wd>
+#                                         materialize a working copy in <wd>
+#   setup      -w <wd>                    bring up the workdir's stack
+#   test       -w <wd>                    run trigger test; rc=0 PASS, rc=1 FAIL
+#   cleanup    -w <wd>                    tear the workdir's stack down
+#
+# Conventions mirror Defects4J:
+#   - one "bug ID" per CVE (always "1"), kept for CLI parity
+#   - test rc=0 means the security property HOLDS (i.e. patched / not exploitable)
+#   - test rc=1 means the trigger reproduced the CVE (i.e. buggy)
+
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$BIN_DIR/.." && pwd)"
+CVES_DIR="$REPO_ROOT/cves"
+
+# shellcheck source=../lib/common.sh
+source "$REPO_ROOT/lib/common.sh"
+
+# ---------- helpers ----------
+
+die_usage() { printf 'usage: cvebench %s\n' "$1" >&2; exit 2; }
+
+pid_dir() {
+  local pid="$1" d="$CVES_DIR/$1"
+  [[ -d "$d" ]] || die "unknown pid: $pid"
+  printf '%s' "$d"
+}
+
+props_path() { printf '%s/cvebench.properties' "$(pid_dir "$1")"; }
+
+# Read one key from a .properties file (ignores comments / blank lines).
+prop_get() {
+  local file="$1" key="$2" line
+  line="$(grep -E "^${key}=" "$file" || true)"
+  [[ -n "$line" ]] || die "property '$key' not found in $file"
+  printf '%s' "${line#${key}=}"
+}
+
+# Same but returns empty without erroring.
+prop_get_opt() {
+  local file="$1" key="$2" line
+  line="$(grep -E "^${key}=" "$file" || true)"
+  printf '%s' "${line#${key}=}"
+}
+
+read_workdir_state() {
+  local wd="$1"
+  [[ -f "$wd/cvebench.properties" ]] || die "not a cvebench workdir: $wd"
+  WD_PID="$(prop_get "$wd/cvebench.properties" pid)"
+  WD_VERSION="$(prop_get "$wd/cvebench.properties" version)"
+}
+
+# ---------- subcommands ----------
+
+cmd_pids() {
+  find "$CVES_DIR" -mindepth 1 -maxdepth 1 -type d \
+    -exec test -f '{}/cvebench.properties' ';' -print | xargs -n1 basename | sort
+}
+
+cmd_bids() {
+  local pid=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p) pid="$2"; shift 2 ;;
+      *)  die_usage "bids -p <pid>" ;;
+    esac
+  done
+  [[ -n "$pid" ]] || die_usage "bids -p <pid>"
+  pid_dir "$pid" >/dev/null
+  echo 1
+}
+
+cmd_info() {
+  local pid="" bid="1"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p) pid="$2"; shift 2 ;;
+      -b) bid="$2"; shift 2 ;;
+      *)  die_usage "info -p <pid> [-b <bid>]" ;;
+    esac
+  done
+  [[ -n "$pid" ]] || die_usage "info -p <pid> [-b <bid>]"
+  local pf; pf="$(props_path "$pid")"
+  printf 'pid       : %s\n' "$pid"
+  printf 'bid       : %s\n' "$bid"
+  printf 'component : %s\n' "$(prop_get "$pf" component)"
+  printf 'summary   : %s\n' "$(prop_get "$pf" summary)"
+  printf 'cwe       : %s\n' "$(prop_get_opt "$pf" cwe)"
+  printf 'cvss      : %s\n' "$(prop_get_opt "$pf" cvss)"
+  printf 'vulnerable: %s\n' "$(prop_get "$pf" vulnerable.image)"
+  printf 'fixed     : %s\n' "$(prop_get "$pf" fixed.image)"
+  printf 'trigger   : %s\n' "$(prop_get "$pf" tests.trigger)"
+  printf 'modified  : %s\n' "$(prop_get "$pf" classes.modified)"
+  printf 'patch.url : %s\n' "$(prop_get_opt "$pf" patch.url)"
+}
+
+cmd_export() {
+  local pid="" prop=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p) pid="$2"; shift 2 ;;
+      -q) prop="$2"; shift 2 ;;
+      -b) shift 2 ;;            # bid ignored, only one bug per CVE
+      *)  die_usage "export -p <pid> -q <property>" ;;
+    esac
+  done
+  [[ -n "$pid" && -n "$prop" ]] || die_usage "export -p <pid> -q <property>"
+  prop_get "$(props_path "$pid")" "$prop"
+  echo
+}
+
+cmd_checkout() {
+  local pid="" version="" wd=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p) pid="$2"; shift 2 ;;
+      -v) version="$2"; shift 2 ;;
+      -w) wd="$2"; shift 2 ;;
+      -b) shift 2 ;;            # bid ignored
+      *)  die_usage "checkout -p <pid> -v <buggy|fixed> -w <workdir>" ;;
+    esac
+  done
+  [[ -n "$pid" && -n "$version" && -n "$wd" ]] || \
+    die_usage "checkout -p <pid> -v <buggy|fixed> -w <workdir>"
+  [[ "$version" == "buggy" || "$version" == "fixed" ]] || \
+    die "version must be 'buggy' or 'fixed' (got: $version)"
+
+  local src; src="$(pid_dir "$pid")"
+  log "checkout $pid ($version) -> $wd"
+  mkdir -p "$wd"
+  # We mirror the CVE tree so callers can poke at scripts / manifests.
+  cp -a "$src/manifests" "$wd/"
+  cp -a "$src/cvebench.properties" "$wd/"
+  for s in setup.sh exploit.sh verify-fix.sh cleanup.sh README.md; do
+    [[ -f "$src/$s" ]] || continue
+    cp -a "$src/$s" "$wd/"
+    # The originals source lib/common.sh via a relative path that only
+    # resolves inside cves/<CVE>/. Rewrite it to an absolute path so the
+    # workdir is self-contained.
+    if [[ "$s" == *.sh ]]; then
+      sed -i "s|\$SCRIPT_DIR/\.\./\.\./lib/common.sh|$REPO_ROOT/lib/common.sh|g" "$wd/$s"
+    fi
+  done
+
+  if [[ "$version" == "fixed" ]]; then
+    local pf="$wd/cvebench.properties" target from to
+    target="$(prop_get "$pf" manifest.target)"
+    from="$(prop_get "$pf" manifest.image.from)"
+    to="$(prop_get "$pf" manifest.image.to)"
+    log "rewriting $target: '$from' -> '$to'"
+    # Plain string substitution (no regex meta in image strings).
+    grep -qF "$from" "$wd/$target" || \
+      die "anchor '$from' not found in $wd/$target"
+    # Use awk for safe literal replacement (avoid sed metachar issues).
+    awk -v from="$from" -v to="$to" '
+      { idx = index($0, from)
+        if (idx > 0) {
+          $0 = substr($0, 1, idx-1) to substr($0, idx+length(from))
+        }
+        print
+      }' "$wd/$target" > "$wd/$target.tmp"
+    mv "$wd/$target.tmp" "$wd/$target"
+  fi
+
+  # Stamp the workdir state so setup/test/cleanup know what to do.
+  # Strip any prior stamp first so checkout is idempotent.
+  local pf="$wd/cvebench.properties"
+  sed -i '/^version=/d; /^checkout\.timestamp=/d' "$pf"
+  {
+    echo "version=$version"
+    echo "checkout.timestamp=$(date -u +%FT%TZ)"
+  } >> "$pf"
+
+  log "ready — workdir prepared at $wd"
+}
+
+cmd_setup() {
+  local wd=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -w) wd="$2"; shift 2 ;;
+      *)  die_usage "setup -w <workdir>" ;;
+    esac
+  done
+  [[ -n "$wd" ]] || die_usage "setup -w <workdir>"
+  read_workdir_state "$wd"
+
+  cluster_up
+  log "applying manifests from $wd ($WD_PID, $WD_VERSION)"
+  kubectl apply -f "$wd/manifests/"
+  # Wait for every Deployment that the apply just made the cluster aware of.
+  # `kubectl get` after apply is authoritative; YAML grep is fragile.
+  for d in $(kubectl get deploy -o name 2>/dev/null); do
+    wait_rollout default "$d"
+  done
+  # Give kube-proxy a moment to publish iptables for the fresh Service —
+  # without this, the first probe can race the NAT rule update. The lag
+  # is worse right after a buggy run that crash-looped the haproxy pod.
+  sleep 5
+  log "setup complete"
+}
+
+cmd_test() {
+  local wd=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -w) wd="$2"; shift 2 ;;
+      *)  die_usage "test -w <workdir>" ;;
+    esac
+  done
+  [[ -n "$wd" ]] || die_usage "test -w <workdir>"
+  read_workdir_state "$wd"
+
+  local trigger; trigger="$(prop_get "$wd/cvebench.properties" tests.trigger)"
+  local script="$wd/$trigger"
+  [[ -x "$script" ]] || die "trigger script not executable: $script"
+
+  log "running trigger: $trigger (workdir=$wd, version=$WD_VERSION)"
+  set +e
+  bash "$script"
+  local trigger_rc=$?
+  set -e
+
+  # exploit.sh contract: rc=0 means CVE reproduced. Invert for benchmark.
+  if [[ $trigger_rc -eq 0 ]]; then
+    printf '[cvebench] %s/%s : FAIL (CVE reproduced)\n' "$WD_PID" "$WD_VERSION"
+    return 1
+  fi
+  printf '[cvebench] %s/%s : PASS (CVE not reproducible)\n' "$WD_PID" "$WD_VERSION"
+  return 0
+}
+
+cmd_cleanup() {
+  local wd="" tear_cluster=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -w) wd="$2"; shift 2 ;;
+      --cluster) tear_cluster=1; shift ;;
+      *)  die_usage "cleanup -w <workdir> [--cluster]" ;;
+    esac
+  done
+  [[ -n "$wd" ]] || die_usage "cleanup -w <workdir> [--cluster]"
+  read_workdir_state "$wd"
+
+  log "deleting workloads for $WD_PID"
+  kubectl delete -f "$wd/manifests/" --ignore-not-found
+
+  if [[ $tear_cluster -eq 1 ]]; then
+    cluster_down
+  fi
+}
+
+# ---------- dispatch ----------
+
+usage() {
+  cat >&2 <<'EOF'
+cvebench — Defects4J-style CVE reproduction harness
+
+usage:
+  cvebench pids
+  cvebench bids       -p <pid>
+  cvebench info       -p <pid> [-b <bid>]
+  cvebench export     -p <pid> -q <property>
+  cvebench checkout   -p <pid> -v <buggy|fixed> -w <workdir>
+  cvebench setup      -w <workdir>
+  cvebench test       -w <workdir>
+  cvebench cleanup    -w <workdir> [--cluster]
+EOF
+  exit 2
+}
+
+[[ $# -ge 1 ]] || usage
+sub="$1"; shift
+case "$sub" in
+  pids)     cmd_pids "$@" ;;
+  bids)     cmd_bids "$@" ;;
+  info)     cmd_info "$@" ;;
+  export)   cmd_export "$@" ;;
+  checkout) cmd_checkout "$@" ;;
+  setup)    cmd_setup "$@" ;;
+  test)     cmd_test "$@" ;;
+  cleanup)  cmd_cleanup "$@" ;;
+  -h|--help|help) usage ;;
+  *) die_usage "unknown subcommand: $sub" ;;
+esac
