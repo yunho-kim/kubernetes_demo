@@ -275,6 +275,14 @@ usage:
   cvebench setup      -w <workdir>
   cvebench test       -w <workdir>
   cvebench cleanup    -w <workdir> [--cluster]
+
+faithful SBFL benchmark (minimal pairs + reg-tests + line coverage):
+  cvebench sbfl pids
+  cvebench sbfl info     -p <CVE>
+  cvebench sbfl compile  [-p <CVE>]
+  cvebench sbfl coverage -p <CVE>
+  cvebench sbfl sbfl     -p <CVE>
+  cvebench sbfl run      [-p <CVE>] | summary | clean
 EOF
   exit 2
 }
@@ -290,6 +298,7 @@ case "$sub" in
   setup)    cmd_setup "$@" ;;
   test)     cmd_test "$@" ;;
   cleanup)  cmd_cleanup "$@" ;;
+  sbfl|fl)  exec "$REPO_ROOT/sbfl/bin/sbfl" "$@" ;;   # faithful SBFL benchmark CLI
   -h|--help|help) usage ;;
   *) die_usage "unknown subcommand: $sub" ;;
 esac
