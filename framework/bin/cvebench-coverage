@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# cvebench-coverage <pid> <bid> — collect per-test line coverage for one bug and
+# classify the suite the Defects4J way, then emit GZoltar artifacts + metadata.
+# Invoked by `cvebench coverage`. Runs HAProxy's own reg-tests via vtest in kind
+# pods against the minimal pair; trigger = fail-on-buggy & pass-on-fixed.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/../lib/cvebench.sh"
+
+PID="${1:?usage: cvebench-coverage <pid> <bid>}"; BID="${2:?need bid}"
+PDIR="$(proj_dir "$PID")"; TDIR="$PDIR/tests/$BID"; PATCH="$PDIR/patches/$BID.fix.patch"
+FIXVER="$(bug_fixedver "$PID" "$BID")"; SRC="/build/haproxy-$FIXVER"
+B="$(bug_image "$PID" "$BID" buggy)"; F="$(bug_image "$PID" "$BID" fixed)"
+R="$RESULTS_ROOT/$PID-$BID"; PB=cvebench-buggy; PF=cvebench-fixed
+
+docker image inspect "$B" "$F" >/dev/null 2>&1 || die "missing images (cvebench compile -p $PID -b $BID)"
+rm -rf "$R"; mkdir -p "$R/buggy" "$R/fixed"
+MODFILES="$(bug_modified_files "$PID" "$BID")"
+log "$PID-$BID ($(bug_cve "$PID" "$BID"))  fixed=$FIXVER  modified: $(echo $MODFILES | tr '\n' ' ')"
+
+# ---- ground truth: diff buggy vs fixed for each modified file ----
+log "computing ground truth (minimal-pair diff)"
+gt=()
+for f in $MODFILES; do
+  docker run --rm "$B" cat "$SRC/$f" > /tmp/gt_b 2>/dev/null
+  docker run --rm "$F" cat "$SRC/$f" > /tmp/gt_f 2>/dev/null
+  python3 "$HERE/gtdiff.py" /tmp/gt_b /tmp/gt_f "$f" > "/tmp/gt_$(echo "$f"|tr / _).json"
+  gt+=("/tmp/gt_$(echo "$f"|tr / _).json")
+done
+python3 - "$R/ground_truth.json" "${gt[@]}" <<'PY'
+import json,sys
+out=sys.argv[1]; files=[]; lines=[]; om=False
+for p in sys.argv[2:]:
+    d=json.load(open(p)); files+=d["files"]; lines+=d["lines"]; om=om or d.get("fault_of_omission",False)
+json.dump({"files":sorted(set(files)),"lines":lines,"fault_of_omission":om},open(out,"w"))
+PY
+
+# ---- cluster + images + pods ----
+cluster_up
+log "loading images into kind"
+kind load docker-image "$B" --name "$KIND_CLUSTER" >/dev/null
+kind load docker-image "$F" --name "$KIND_CLUSTER" >/dev/null
+cp_in() { k exec -i "$1" -- sh -c "cat > $3" < "$2"; }
+deploy() { local pod="$1" img="$2" cap="${3:-}"
+  k delete pod "$pod" --ignore-not-found --now >/dev/null 2>&1 || true
+  k apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: { name: $pod }
+spec:
+  containers:
+  - name: haproxy
+    image: $img
+    imagePullPolicy: Never
+    command: ["sleep","infinity"]
+$( [[ "$cap" == ptrace ]] && printf '    securityContext: { capabilities: { add: ["SYS_PTRACE"] } }' )
+EOF
+}
+deploy "$PB" "$B" ptrace; deploy "$PF" "$F"
+k wait --for=condition=Ready "pod/$PB" "pod/$PF" --timeout=180s >/dev/null
+
+GLOBS="$(grep -vE '^\s*#|^\s*$' "$TDIR/regtests.txt" | tr '\n' ' ')"
+for pod in "$PB" "$PF"; do
+  cp_in "$pod" "$PDIR/build/runsuite.sh" /runsuite.sh
+  cp_in "$pod" "$TDIR/trigger.vtc" "$SRC/reg-tests/_sbfl_trigger.vtc"
+  k exec "$pod" -- sh -c "cd $SRC && ls $GLOBS reg-tests/_sbfl_trigger.vtc 2>/dev/null" > "/tmp/list_$pod" || true
+  cp_in "$pod" "/tmp/list_$pod" /tmp/list.txt
+done
+log "suite: $(wc -l < "/tmp/list_$PB") candidate tests"
+
+COV_TICK=""; [[ -f "$TDIR/build.env" ]] && source "$TDIR/build.env"
+log "running suite on BUGGY (coverage${COV_TICK:+, COV_TICK=$COV_TICK})"
+k exec "$PB" -- env ${COV_TICK:+COV_TICK=$COV_TICK} bash /runsuite.sh "$SRC" /tmp/list.txt /tmp/out cov 2>&1 | tail -1
+log "running suite on FIXED (outcomes)"
+k exec "$PF" -- bash /runsuite.sh "$SRC" /tmp/list.txt /tmp/out outcome 2>&1 | tail -1
+kubectl --context "$KCTX" cp "$PB:/tmp/out/." "$R/buggy/" >/dev/null
+kubectl --context "$KCTX" cp "$PF:/tmp/out/." "$R/fixed/" >/dev/null
+
+log "classifying + GZoltar artifacts"
+python3 "$HERE/assemble.py" "$R"
+
+# ---- Defects4J metadata (per-bug files under the project) ----
+echo "$MODFILES" > "$PDIR/modified_classes/$BID"
+python3 - "$R/classification.json" "$PDIR" "$BID" <<'PY'
+import json,sys
+c=json.load(open(sys.argv[1])); P,b=sys.argv[2],sys.argv[3]
+open(f"{P}/trigger_tests/{b}","w").write("\n".join(c["triggers"])+"\n")
+open(f"{P}/relevant_tests/{b}","w").write("\n".join(c["relevant"])+"\n")
+open(f"{P}/loaded_classes/{b}","w").write("\n".join(c["loaded"])+"\n")
+PY
+
+echo; log "=============== SBFL ranking ($PID-$BID) ==============="
+python3 "$HERE/sbfl-rank" -r "$R" --top 15 --json-out "$R/ranking.json"

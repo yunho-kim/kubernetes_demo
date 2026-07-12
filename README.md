@@ -1,151 +1,114 @@
-# Kubernetes CVE Reproduction Lab
+# cvebench — a Defects4J-style CVE benchmark (HAProxy)
 
-Self-contained environment for reproducing Kubernetes-ecosystem CVEs against a
-local `kind` cluster. Each CVE lives in its own directory under `cves/` with
-a uniform set of scripts so reproductions are deterministic and disposable.
+A reproducible benchmark of real CVEs, organized like **[Defects4J](https://github.com/rjust/defects4j)**
+but targeting **C / HAProxy** instead of Java. A *project* is the software under
+test; a *bug* is a CVE. Reproducing a CVE is just **running its trigger test**,
+and fault-localization / automated-program-repair techniques apply on top of the
+same `checkout → compile → test → coverage` contract — exactly as researchers use
+Defects4J.
 
-## Prerequisites
+## Faithfulness to Defects4J
 
-- Docker (running, current user in the `docker` group)
-- Bash, `curl`, `nc` (or `/dev/tcp` redirection — used by some exploits)
-
-`kind` and `kubectl` are vendored into `./bin/` so the lab is self-contained.
-Every CVE script sources `lib/common.sh`, which prepends `./bin/` to `PATH`.
+| Defects4J | cvebench |
+| --- | --- |
+| project (Lang, Chart, …) | `haproxy` (under `framework/projects/`) |
+| bug `<PID>-<bid>` (Lang-1) | `haproxy-1`, `haproxy-2`, `haproxy-3` (a CVE each) |
+| `commit-db` maps bid → revisions | `commit-db` maps bid → CVE, fixed release, fix commit, CWE, CVSS |
+| minimal buggy↔fixed pair | **buggy = fixed release with `patches/<bid>.fix.patch` reverse-applied** |
+| project's own test suite | HAProxy's `reg-tests/` run via `vtest` |
+| trigger tests expose the bug | `trigger_tests/<bid>` — *fail on buggy, pass on fixed* (= the CVE reproduction) |
+| `checkout / compile / test / coverage` | same verbs (`framework/bin/cvebench`) |
+| `modified_classes`, `relevant_tests`, `loaded_classes` | same per-bug metadata files |
 
 ## Layout
 
 ```
-.
-├── bin/                  # pinned kind + kubectl + cvebench harness
-├── cluster/
-│   └── kind-config.yaml  # single-node, NodePort 30080 mapped to host
-├── lib/
-│   └── common.sh         # cluster up/down, kubectl helpers
-├── cves/
-│   └── <CVE-ID>/
-│       ├── README.md             # vuln summary, mechanism, expected output
-│       ├── manifests/            # k8s YAML
-│       ├── setup.sh              # bring up cluster + deploy vulnerable stack
-│       ├── exploit.sh            # demonstrate the vulnerability
-│       ├── verify-fix.sh         # patch to a fixed version, re-run probe
-│       ├── cleanup.sh            # tear down the workloads (cluster optional)
-│       └── cvebench.properties   # Defects4J-style metadata for the harness
-└── sbfl/                 # faithful Defects4J-style SBFL benchmark (see sbfl/README.md)
-    ├── images/           # minimal-pair coverage build + in-pod suite runner + gcov-flush wrapper
-    ├── patches/          # upstream fix patches (reverse-applied to make the buggy build)
-    ├── cves/<CVE-ID>/    # reg-test globs + crafted trigger.vtc + build.env
-    ├── bin/              # sbfl CLI, coverage collector, gtdiff, assemble, ranking engine
-    ├── projects/<CVE>/   # Defects4J-style metadata (commit-db, trigger/relevant tests, ...)
-    └── results/<CVE>/    # tests.json, gzoltar/, ground_truth.json, ranking.json
+framework/
+├── bin/
+│   ├── cvebench              # the CLI
+│   ├── cvebench-coverage     # per-test coverage collector (kind + vtest)
+│   ├── gtdiff.py             # buggy↔fixed diff → exact line-level ground truth
+│   ├── assemble.py           # classify suite → GZoltar spectra/matrix/tests
+│   └── sbfl-rank             # Ochiai/Tarantula/Jaccard/DStar + EXAM
+├── lib/cvebench.sh           # commit-db + kind-cluster helpers
+└── projects/haproxy/
+    ├── commit-db             # bid,cve,fixed_version,fix_commit,cwe,cvss,summary
+    ├── patches/<bid>.fix.patch
+    ├── tests/<bid>/          # trigger.vtc, regtests.txt, build.env
+    ├── build/                # Dockerfile.minpair, cov-flush-wrapper.sh, runsuite.sh
+    ├── trigger_tests/<bid>  relevant_tests/<bid>  modified_classes/<bid>  loaded_classes/<bid>
+bin/                          # vendored kind + kubectl
 ```
 
-## Reproducing a CVE
+## Prerequisites
+
+Docker (running, user in the `docker` group). `kind` and `kubectl` are vendored
+in `./bin/`. Coverage builds compile HAProxy from source and run its `reg-tests`
+under `vtest` inside a `kind` pod.
+
+## CLI
 
 ```bash
-cd cves/CVE-2023-45539
-./setup.sh         # creates kind cluster (if needed) + deploys vulnerable stack
-./exploit.sh       # sends the malicious request, asserts misbehavior
-./verify-fix.sh    # rolls forward to a patched version, asserts safe behavior
-./cleanup.sh       # removes workloads (pass --cluster to also delete kind)
+cvebench=framework/bin/cvebench
+
+$cvebench pids                                   # haproxy
+$cvebench bids   -p haproxy                      # 1 2 3
+$cvebench info   -p haproxy -b 3                 # metadata + result
+$cvebench export -p haproxy -b 3 -q fix_commit
 ```
 
-## Adding a new CVE
-
-Copy an existing `cves/<CVE-ID>/` directory as a template. Keep the four-script
-contract (`setup` / `exploit` / `verify-fix` / `cleanup`) so every CVE is
-reproduced the same way. Add a `cvebench.properties` file so the harness can
-checkout / test / export the CVE alongside the others.
-
-## Available CVEs
-
-| ID | Component | Class | Status |
-| --- | --- | --- | --- |
-| [CVE-2021-40346](cves/CVE-2021-40346/README.md) | HAProxy 2.0–2.4.3 | HTX header length overflow → HTTP smuggling | ready |
-| [CVE-2022-0711](cves/CVE-2022-0711/README.md)   | HAProxy 2.2–2.5.1 | Infinite loop on `Set-Cookie2` → DoS | ready |
-| [CVE-2023-45539](cves/CVE-2023-45539/README.md) | HAProxy < 2.8.2  | URI fragment misparse → backend confusion | ready |
-
-## cvebench — Defects4J-style harness
-
-`bin/cvebench` is a small CLI that drives the three reproductions through
-the same checkout / setup / test / cleanup contract Defects4J uses, so the
-CVEs can be consumed as a fault-localization / automated-patching
-benchmark. Each `cves/<CVE-ID>/cvebench.properties` declares the vulnerable
-image, the fixed image, the trigger script, and the upstream files modified
-by the fix (`classes.modified` — the fault-localization ground truth).
-
+### Reproduce a CVE (= run its trigger test)
 ```bash
-./bin/cvebench pids                       # list CVE project IDs
-./bin/cvebench info -p CVE-2022-0711      # show metadata for one CVE
-./bin/cvebench export -p CVE-2022-0711 -q vulnerable.image
-
-# Defects4J-style buggy / fixed workflow
-BUGGY=/tmp/cvebench-buggy
-FIXED=/tmp/cvebench-fixed
-
-./bin/cvebench checkout -p CVE-2022-0711 -v buggy -w "$BUGGY"
-./bin/cvebench setup    -w "$BUGGY"
-./bin/cvebench test     -w "$BUGGY"             # rc=1 FAIL (CVE reproduced)
-./bin/cvebench cleanup  -w "$BUGGY" --cluster   # recreate cluster between runs
-
-./bin/cvebench checkout -p CVE-2022-0711 -v fixed -w "$FIXED"
-./bin/cvebench setup    -w "$FIXED"
-./bin/cvebench test     -w "$FIXED"             # rc=0 PASS (patched)
-./bin/cvebench cleanup  -w "$FIXED" --cluster
+$cvebench compile -p haproxy -b 3                # build buggy+fixed coverage images
+$cvebench test    -p haproxy -b 3                # buggy: trigger FAILS (reproduced); fixed: PASSES
 ```
 
-**Always pass `--cluster` to `cleanup` between runs.** The buggy HAProxy
-pod crash-loops during the exploit, which leaves stale kernel conntrack
-entries that misroute traffic to the next pod even after the Service is
-recreated. Tearing the kind cluster down (~30s) avoids the flakiness.
-
-Test semantics (matches Defects4J intent):
-
-| Workdir version | Trigger result        | `cvebench test` rc |
-| --- | --- | --- |
-| `buggy`         | CVE reproduces        | `1` (FAIL)         |
-| `fixed`         | CVE does not reproduce| `0` (PASS)         |
-
-The harness only operates on **one CVE at a time** — all three CVEs use the
-same `default` namespace and the same `haproxy` Service, so they collide if
-you try to setup two at once. Always `cvebench cleanup` between CVEs.
-
-## sbfl — a faithful Defects4J-style SBFL benchmark
-
-`sbfl/` is a Spectrum-Based Fault Localization benchmark built like **Defects4J**,
-targeting C / HAProxy. Each CVE is a bug with a **minimal buggy↔fixed pair**, the
-project's **own test suite**, **exact line-level ground truth**, and standard SBFL
-artifacts:
-
-- **Minimal pair** — buggy = the fixed release with the upstream fix **reverse-applied**
-  (`patch -R`), so buggy and fixed differ by *only* the fix.
-- **Ground truth** — the buggy↔fixed source `diff`, snapped to the nearest executable
-  line (no hand anchors; handles faults of omission).
-- **Real suite** — HAProxy's own `reg-tests/` run via **vtest**; triggers are
-  auto-discovered the Defects4J way (*fail-on-buggy ∧ pass-on-fixed*), passing tests
-  *pass on both*.
-- **Coverage** — per-test line coverage of a `gcc --coverage` build, collected in
-  `kind` pods (flushed via a `gdb __gcov_dump()` wrapper — works even for the
-  infinite-loop CVE).
-- **Artifacts** — GZoltar `spectra`/`matrix`/`tests` + Defects4J `projects/<CVE>/`
-  metadata, ranked with Ochiai/Tarantula/Jaccard/DStar and scored by EXAM.
-
+### Fault localization
 ```bash
-cvebench sbfl compile           # build the minimal-pair coverage images (all CVEs)
-cvebench sbfl run               # coverage + classify + rank for all CVEs, then summary
-cvebench sbfl coverage -p CVE-2022-0711   # one CVE
-cvebench sbfl info    -p CVE-2022-0711    # metadata + result
-cvebench sbfl summary           # fault-rank table        (sbfl/bin/sbfl is the same CLI)
+$cvebench coverage -p haproxy -b 3               # per-test coverage + classify + rank
+$cvebench sbfl     -p haproxy -b 3               # re-rank; $cvebench summary for the table
 ```
 
-Results (Ochiai, line granularity, `rank` = best–worst tie bounds):
+### Automated program repair (patch generation)
+```bash
+$cvebench checkout -p haproxy -b 3 -v buggy -w /tmp/wd   # buggy source in a workdir
+#   ... an APR tool edits /tmp/wd/haproxy-2.8.2/... ...
+$cvebench compile -p haproxy -b 3 && $cvebench test -p haproxy -b 3   # evaluate the candidate
+```
 
-| CVE | tests (f/p) | lines | fault rank | EXAM | character |
+## Bugs
+
+| bug | CVE | CWE | CVSS | fixed in | fault file |
 | --- | --- | --- | --- | --- | --- |
-| CVE-2022-0711 | 1 / 19 | 19716 | 1–86 | 0.0000 | easy — cookie loop is fail-only |
-| CVE-2023-45539 | 2 / 36 | 27188 | 673–719 | 0.0247 | medium — missing `#` check |
-| CVE-2021-40346 | 1 / 19 | 19465 | 3405–8049 | 0.1749 | hard — overflow on an always-run line |
+| haproxy-1 | CVE-2021-40346 | CWE-190 | 8.6 | 2.4.4 | `include/haproxy/htx.h` |
+| haproxy-2 | CVE-2022-0711 | CWE-835 | 7.5 | 2.4.13 | `src/http_ana.c` |
+| haproxy-3 | CVE-2023-45539 | CWE-436 | 8.2 | 2.8.2 | `src/h1.c` |
 
-SBFL discriminates a line only when failing and passing tests cover it differently,
-so these CVEs span a natural difficulty range. See [`sbfl/README.md`](sbfl/README.md)
-for the full design (minimal pairs, vtest, gcov-flush wrapper, ground-truth snapping)
-and interpretation.
+## Fault-localization results (Ochiai, line-level)
+
+| bug | tests (f/p) | lines | fault rank | EXAM | character |
+| --- | --- | --- | --- | --- | --- |
+| haproxy-2 | 1 / 19 | 19716 | 1–86 | 0.0000 | easy — the loop is entered only by the trigger |
+| haproxy-3 | 2 / 36 | 27188 | 673–719 | 0.0247 | medium — missing `#` check |
+| haproxy-1 | 1 / 19 | 19465 | 3405–8049 | 0.1749 | hard — overflow on an always-executed line |
+
+`results/` (per-test coverage, GZoltar `spectra`/`matrix`/`tests`, rankings) is
+generated by `cvebench coverage` and git-ignored; the benchmark *definition*
+(`commit-db`, patches, tests, metadata) is committed.
+
+## How it works
+
+- **Minimal pair** — `cvebench compile` builds the fixed release from source with
+  `gcc --coverage`; the buggy image reverse-applies the fix patch. Only the fix differs.
+- **Ground truth** — the buggy↔fixed source `diff`, snapped to the nearest executable
+  (covered) line; handles faults of omission.
+- **Coverage flush** — HAProxy is wrapped so a `gdb __gcov_dump()` fires on stop (and
+  periodically for the CVE-2022-0711 infinite loop, which the watchdog would otherwise
+  abort before flushing).
+- **Classification** — each reg-test runs on both buggy and fixed; *fail-on-buggy ∧
+  pass-on-fixed* ⇒ trigger, *pass-on-both* ⇒ passing test, else excluded.
+
+## Adding a bug
+
+Add a `commit-db` row, drop the upstream fix at `patches/<bid>.fix.patch`, add
+`tests/<bid>/trigger.vtc` (+ `regtests.txt`), then `cvebench compile/coverage`.

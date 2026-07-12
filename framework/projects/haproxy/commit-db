@@ -1,0 +1,5 @@
+# bid,cve,fixed_version,fix_commit,cwe,cvss,summary
+# buggy = fixed_version source with patches/<bid>.fix.patch reverse-applied (minimal pair)
+1,CVE-2021-40346,2.4.4,3b69886,CWE-190,8.6,HTX header-length integer overflow enabling HTTP request smuggling
+2,CVE-2022-0711,2.4.13,bfb15ab,CWE-835,7.5,Infinite loop on Set-Cookie2 response header (DoS)
+3,CVE-2023-45539,2.8.2,2eab6d3,CWE-436,8.2,URI '#' accepted in path component causing backend misrouting

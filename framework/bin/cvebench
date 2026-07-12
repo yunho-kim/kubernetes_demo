@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# cvebench — a Defects4J-style harness for CVE bugs (project = software under test,
+# bug = a CVE). A bug's buggy version is the fixed release with the upstream fix
+# reverse-applied (minimal pair). Reproducing the CVE = running its trigger test.
+#
+#   cvebench pids
+#   cvebench bids     -p <pid>
+#   cvebench info     -p <pid> -b <bid>
+#   cvebench export   -p <pid> -b <bid> -q <field>
+#   cvebench checkout -p <pid> -b <bid> -v <buggy|fixed> -w <workdir>   # source for APR
+#   cvebench compile  -p <pid> -b <bid>                                  # build coverage images
+#   cvebench test     -p <pid> -b <bid> [-v <buggy|fixed>]              # run trigger (reproduce CVE)
+#   cvebench coverage -p <pid> -b <bid>                                  # per-test coverage + classify
+#   cvebench sbfl     -p <pid> -b <bid>                                  # rank suspicious lines
+#   cvebench summary  | cvebench clean
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/../lib/cvebench.sh"
+
+# ---- arg parsing ----
+PID="" BID="" VAR="" WD="" Q=""
+args() { while [[ $# -gt 0 ]]; do case "$1" in
+  -p) PID="$2"; shift 2;; -b) BID="$2"; shift 2;; -v) VAR="$2"; shift 2;;
+  -w) WD="$2"; shift 2;; -q) Q="$2"; shift 2;; *) shift;; esac; done; }
+need() { for v; do [[ -n "${!v}" ]] || die "missing -${v:0:1} (need $*)"; done; }
+results_dir() { printf '%s/%s-%s' "$RESULTS_ROOT" "$PID" "$BID"; }
+
+# ---- helpers ----
+src_tarball() { # <fixver> <dest_dir>   download + extract haproxy source
+  local v="$1" d="$2" br="${1%.*}"
+  mkdir -p "$d"; ( cd "$d" && wget -q "https://www.haproxy.org/download/${br}/src/haproxy-${v}.tar.gz" \
+    && tar xzf "haproxy-${v}.tar.gz" && rm -f "haproxy-${v}.tar.gz" )
+}
+
+# ====================================================================
+cmd_pids() { list_pids; }
+cmd_bids() { need PID; list_bids "$PID"; }
+
+cmd_export() { need PID BID Q
+  case "$Q" in
+    cve) bug_cve "$PID" "$BID";; fixed_version) bug_fixedver "$PID" "$BID";;
+    fix_commit) bug_fixcommit "$PID" "$BID";; cwe) bug_cwe "$PID" "$BID";;
+    cvss) bug_cvss "$PID" "$BID";; summary) bug_summary "$PID" "$BID";;
+    modified_classes) bug_modified_files "$PID" "$BID";;
+    *) die "unknown field: $Q";; esac; echo; }
+
+cmd_info() { need PID BID
+  printf 'project      : %s\n' "$PID"
+  printf 'bug          : %s-%s  (%s)\n' "$PID" "$BID" "$(bug_cve "$PID" "$BID")"
+  printf 'summary      : %s\n' "$(bug_summary "$PID" "$BID")"
+  printf 'cwe / cvss   : %s / %s\n' "$(bug_cwe "$PID" "$BID")" "$(bug_cvss "$PID" "$BID")"
+  printf 'fixed release: %s   fix commit: %s\n' "$(bug_fixedver "$PID" "$BID")" "$(bug_fixcommit "$PID" "$BID")"
+  printf 'buggy        : fixed release with patches/%s.fix.patch reverse-applied\n' "$BID"
+  printf 'modified     : %s\n' "$(bug_modified_files "$PID" "$BID" | tr '\n' ' ')"
+  local rj; rj="$(results_dir)/ranking.json"
+  [[ -f "$rj" ]] && python3 - "$rj" <<'PY' || printf 'result       : (not run — cvebench coverage)\n'
+import json,sys
+d=json.load(open(sys.argv[1])); o=d["formulas"]["ochiai"]; fr=o.get("fault_rank")
+print("tests (f/p)  : %d / %d   components: %d" % (len(d["failing"]),len(d["passing"]),d["n_lines"]))
+if fr: print("fault rank   : %s%s of %d   (Ochiai, EXAM %.4f)"%(fr[0],""if fr[1]==fr[0] else f"-{fr[1]}",fr[2],o["exam"]))
+PY
+}
+
+cmd_checkout() { need PID BID VAR WD
+  [[ "$VAR" == buggy || "$VAR" == fixed ]] || die "version must be buggy|fixed"
+  local v; v="$(bug_fixedver "$PID" "$BID")"
+  log "checkout $PID-$BID ($VAR) -> $WD"
+  rm -rf "$WD"; src_tarball "$v" "$WD"
+  local src="$WD/haproxy-$v"
+  if [[ "$VAR" == buggy ]]; then
+    log "reverse-applying the fix (minimal pair)"
+    ( cd "$src" && patch -R -p1 < "$(proj_dir "$PID")/patches/$BID.fix.patch" >/dev/null )
+  fi
+  cp -a "$(proj_dir "$PID")/tests/$BID" "$WD/cvebench-tests"
+  printf '%s %s %s\n' "$PID" "$BID" "$VAR" > "$WD/cvebench.bug"
+  log "source ready at $src  (modify -> cvebench compile/test to evaluate a patch)"
+}
+
+cmd_compile() { need PID BID
+  local v ctx tag extra=""
+  v="$(bug_fixedver "$PID" "$BID")"; ctx="$(proj_dir "$PID")"
+  [[ -f "$ctx/tests/$BID/build.env" ]] && source "$ctx/tests/$BID/build.env"
+  for variant in fixed buggy; do
+    tag="$(bug_image "$PID" "$BID" "$variant")"
+    log "building $tag (haproxy $v, $variant${extra:+, ${EXTRA_MAKE:-}})"
+    docker build --build-arg "HAPROXY_VERSION=$v" --build-arg "VARIANT=$variant" \
+      --build-arg "FIX_PATCH=patches/$BID.fix.patch" --build-arg "EXTRA_MAKE=${EXTRA_MAKE:-}" \
+      -t "$tag" -f "$ctx/build/Dockerfile.minpair" "$ctx" >/dev/null || die "build failed: $tag"
+  done
+  log "compiled $(bug_image "$PID" "$BID" buggy) and -fixed"
+}
+
+cmd_test() { need PID BID
+  local variants=("${VAR:-buggy}"); [[ -z "$VAR" ]] && variants=(buggy fixed)
+  local trig="$(proj_dir "$PID")/tests/$BID/trigger.vtc" src; src="$(bug_srcdir "$PID" "$BID")"
+  for variant in "${variants[@]}"; do
+    local img; img="$(bug_image "$PID" "$BID" "$variant")"
+    docker image inspect "$img" >/dev/null 2>&1 || die "missing $img (cvebench compile -p $PID -b $BID)"
+    set +e
+    docker run --rm -i --cap-add=SYS_PTRACE "$img" bash -c \
+      "cat > /t.vtc; cd $src && HAPROXY_PROGRAM=/usr/local/bin/haproxy timeout 90 vtest /t.vtc >/dev/null 2>&1" \
+      < "$trig"; local rc=$?
+    set -e
+    if [[ "$variant" == buggy ]]; then
+      [[ $rc -ne 0 ]] && log "$PID-$BID buggy : trigger FAILED -> CVE REPRODUCED (rc=$rc)" \
+                       || warn "$PID-$BID buggy : trigger passed -> NOT reproduced"
+    else
+      [[ $rc -eq 0 ]] && log "$PID-$BID fixed : trigger PASSED -> fix verified" \
+                       || warn "$PID-$BID fixed : trigger failed (rc=$rc)"
+    fi
+  done
+}
+
+cmd_coverage() { need PID BID; "$HERE/cvebench-coverage" "$PID" "$BID"; }
+cmd_sbfl() { need PID BID
+  python3 "$HERE/sbfl-rank" -r "$(results_dir)" --top 15 --json-out "$(results_dir)/ranking.json"; }
+
+cmd_summary() {
+  python3 - "$RESULTS_ROOT" <<'PY'
+import json,os,sys
+root=sys.argv[1]; rows=[]
+for d in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+    rj=os.path.join(root,d,"ranking.json")
+    if not os.path.exists(rj): continue
+    x=json.load(open(rj)); o=x["formulas"].get("ochiai",{}); fr=o.get("fault_rank")
+    rank=(f"{fr[0]}"+("" if fr[1]==fr[0] else f"-{fr[1]}")) if fr else "NOT FOUND"
+    rows.append((d,f"{len(x['failing'])}/{len(x['passing'])}",x.get("n_lines"),rank,
+                 f"{o.get('exam'):.4f}" if o.get("exam") is not None else "-"))
+w=max([len(r[0]) for r in rows]+[8]) if rows else 8
+print(f"{'bug':<{w}}  tests(f/p)  lines  ochiai-rank   EXAM"); print("-"*(w+38))
+for d,tp,nl,rank,exam in rows: print(f"{d:<{w}}  {tp:>9}  {str(nl):>5}  {rank:>11}   {exam}")
+PY
+}
+
+[[ $# -ge 1 ]] || die "usage: cvebench {pids|bids|info|export|checkout|compile|test|coverage|sbfl|summary|clean} ..."
+sub="$1"; shift || true; args "$@"
+case "$sub" in
+  pids) cmd_pids;; bids) cmd_bids;; info) cmd_info;; export) cmd_export;;
+  checkout) cmd_checkout;; compile) cmd_compile;; test) cmd_test;;
+  coverage) cmd_coverage;; sbfl) cmd_sbfl;; summary) cmd_summary;; clean) cluster_down;;
+  *) die "unknown subcommand: $sub";;
+esac
