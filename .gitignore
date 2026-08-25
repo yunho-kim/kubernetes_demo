@@ -4,3 +4,4 @@ framework/tools/*/.venv/
 __pycache__/
 framework/projects/*/build/.candidate-*
 framework/tools/*/upstream/
+slides/
