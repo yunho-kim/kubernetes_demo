@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""run — cvebench adapter for LLMAO (Yang, Le Goues, Martins, Hellendoorn, ICSE 2024).
+
+    run <results-dir> [-o <out-dir>] [--model 350M|6B|16B] [--device auto|cuda|cpu]
+        [--max-files N] [--all-files] [--offset 0]
+
+LLMAO is test-free: it scores source lines from the code alone. The adapter
+decides WHICH files to score from the spectrum — files that contain lines
+executed by a failing test, ordered by their best Op2 line score, top N (default
+30; --all-files scores every file executed by a failing test). Then:
+
+  1. cvebench checkout -v buggy  -> <out-dir>/workdir  (the code to score)
+  2. .venv/bin/python llmao_infer.py  (CodeGen + Devign adapter head, chunked)
+  3. rankings (all spectrum lines):
+       llmao_<model>            LLMAO probability; unscored lines last
+       llmao_<model>_cov        same, but lines never executed by a failing test are
+                                demoted below every executed one (coverage filter)
+       llmao_<model>_op2tb      ties broken by Op2 (hybrid)
+
+Standard-library Python; the model runs from the venv prepare.sh creates.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
+import flcommon as fl  # noqa: E402
+
+VENV_PY = os.path.join(HERE, ".venv", "bin", "python")
+CVEBENCH = os.path.join(FW_ROOT, "bin", "cvebench")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("results")
+    ap.add_argument("-o", "--out-dir", default=None)
+    ap.add_argument("--model", default="350M", choices=("350M", "6B", "16B"))
+    ap.add_argument("--device", default="auto")
+    ap.add_argument("--max-files", type=int, default=30)
+    ap.add_argument("--all-files", action="store_true")
+    ap.add_argument("--offset", type=int, default=0)
+    ap.add_argument("--top", type=int, default=15)
+    ap.add_argument("--metric", action="append", default=None, help=argparse.SUPPRESS)
+    args = ap.parse_args()
+
+    if not os.access(VENV_PY, os.X_OK):
+        raise SystemExit(f"llmao venv missing — run {HERE}/prepare.sh (cvebench prepare -t llmao)")
+    out_dir = args.out_dir or os.path.join(args.results, "fl", "llmao")
+    os.makedirs(out_dir, exist_ok=True)
+    name = os.path.basename(os.path.abspath(args.results)); pid, bid = name.rsplit("-", 1)
+
+    spectrum, failing, passing = fl.build_spectrum(args.results)
+    F = len(failing); P = len(passing)
+    gt = fl.load_ground_truth(args.results)
+
+    # ---- files to score: executed by a failing test, ordered by best Op2 line
+    best = {}
+    for (f, ln), (ef, ep, nf, np_) in spectrum.items():
+        if ef > 0:
+            s = ef - ep / (P + 1)
+            best[f] = max(best.get(f, -1e9), s)
+    files = sorted(best, key=lambda f: (-best[f], f))
+    if not args.all_files:
+        files = files[: args.max_files]
+    print(f"[llmao] {name}: {len(best)} files executed by failing tests; scoring {len(files)} "
+          f"(model {args.model})", flush=True)
+    if gt:
+        print(f"[llmao] ground-truth files in selection: {sorted(gt['files'] & set(files))}", flush=True)
+
+    # ---- buggy checkout
+    wd = os.path.join(out_dir, "workdir")
+    if not os.path.exists(os.path.join(wd, "cvebench.bug")):
+        r = subprocess.run([CVEBENCH, "checkout", "-p", pid, "-b", bid, "-v", "buggy", "-w", wd],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SystemExit("checkout failed: " + r.stderr)
+    src = next(os.path.join(wd, d) for d in os.listdir(wd) if d.startswith("haproxy-"))
+
+    # ---- inference in the venv
+    scores_path = os.path.join(out_dir, f"scores_{args.model}.json")
+    cmd = [VENV_PY, os.path.join(HERE, "llmao_infer.py"), "--src", src, "--out", scores_path,
+           "--model", args.model, "--device", args.device, "--offset", str(args.offset), "--files"] + files
+    with open(os.path.join(out_dir, "infer.log"), "w") as logf:
+        r = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT)
+    if r.returncode != 0 or not os.path.exists(scores_path):
+        raise SystemExit(f"llmao inference failed — see {out_dir}/infer.log")
+    sc = json.load(open(scores_path))
+    prob = {(f, int(ln)): p for f, d in sc["files"].items() for ln, p in d.items()}
+    scored_lines = sum(1 for e in spectrum if e in prob)
+    print(f"[llmao] scored {len(prob)} lines in {len(sc['files'])} files ({scored_lines} in the spectrum) on {sc['device']}", flush=True)
+
+    # ---- rankings over the full spectrum
+    op2 = {e: s[0] - s[1] / (P + 1) for e, s in spectrum.items()}
+    lo, hi = min(op2.values()), max(op2.values()); span = (hi - lo) or 1.0
+    tb = {e: 0.999 * (v - lo) / span for e, v in op2.items()}
+    tag = f"llmao_{args.model}"
+    rankings = {}
+    plain = [(e, prob.get(e, -1.0)) for e in spectrum]
+    plain.sort(key=lambda x: (-x[1], x[0][0], x[0][1])); rankings[tag] = plain
+    cov = [(e, (prob.get(e, -1.0) if spectrum[e][0] > 0 else prob.get(e, -1.0) - 10.0)) for e in spectrum]
+    cov.sort(key=lambda x: (-x[1], x[0][0], x[0][1])); rankings[tag + "_cov"] = cov
+    hyb = [(e, s + 1e-6 * tb[e]) for e, s in cov]
+    hyb.sort(key=lambda x: (-x[1], x[0][0], x[0][1])); rankings[tag + "_cov_op2tb"] = hyb
+
+    print(f"# LLMAO  results={args.results}  model=codegen-{args.model}-multi + devign_{args.model}")
+    print(f"#   failing tests ({F}): {', '.join(failing)}")
+    print(f"#   files scored: {len(sc['files'])}; lines scored: {len(prob)}")
+    if gt:
+        print(f"#   ground-truth lines: {sorted(gt['lines'])}")
+    print()
+
+    def detail(e):
+        return f"(p={prob[e]:.3f})" if e in prob else "(unscored)"
+    formulas = {k: fl.report(k, v, gt, args.top, detail) for k, v in rankings.items()}
+    for f_ in formulas.values():
+        f_["files_scored"] = len(sc["files"]); f_["device"] = sc["device"]
+    fl.write_ranking(out_dir, "llmao", failing, passing, len(spectrum), formulas)
+
+
+if __name__ == "__main__":
+    main()

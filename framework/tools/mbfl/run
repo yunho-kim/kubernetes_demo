@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""run — cvebench adapter for Mutation-Based Fault Localization with Mull.
+
+    run <results-dir> [-o <out-dir>] [--top N | --all] [--files REGEX] [--mutators M,..]
+        [--jobs J] [--timeout S] [--max-mutants K --seed S] [--rebuild] [--skip-run]
+
+Pipeline
+  1. candidate lines  = lines executed by EVERY failing test (MUSE's "statements
+     covered by failing tests"), ordered by the number of passing tests that
+     execute them (ep ascending — the order every SBFL formula agrees on once
+     ef is fixed); keep the top N (default 300; --all keeps them all).
+  2. build the buggy program with clang + Mull's IR plugin, mutating only the
+     files that hold candidate lines (mull.yml includePaths); every mutant is
+     baked into one binary and enabled at run time by an environment variable
+     named after it.  (image: cvebench-mbfl:<pid>-<bid>-<cfg>)
+  3. baseline: run the bug's classified suite on the unmutated binary; tests
+     whose outcome differs from tests.json are dropped as unstable.
+  4. for every mutant on a candidate line run the tests that COVER that line
+     (others cannot be affected); one container per mutant, J in parallel.
+  5. kill matrix -> Metallaxis (Ochiai / D*) and MUSE line scores; lines never
+     mutated rank last (tied).  Writes ranking.json + mutants.json.
+
+Standard-library Python on the host; the toolchain lives in the image that
+prepare.sh builds (framework/tools/mbfl/Dockerfile.base).
+"""
+import argparse
+import concurrent.futures as cf
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+REPO_ROOT = os.path.abspath(os.path.join(FW_ROOT, ".."))
+sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
+import flcommon as fl  # noqa: E402
+
+VERSIONS = {}
+with open(os.path.join(HERE, "versions.env")) as fh:
+    for line in fh:
+        line = line.split("#", 1)[0].strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            VERSIONS[k] = v
+for k, v in VERSIONS.items():                       # expand ${LLVM} etc.
+    VERSIONS[k] = re.sub(r"\$\{(\w+)\}", lambda m: VERSIONS.get(m.group(1), ""), v)
+LLVM, BASE_IMAGE = VERSIONS["LLVM"], VERSIONS["BASE_IMAGE"]
+
+
+def log(msg):
+    print(f"[mbfl] {msg}", flush=True)
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+# ---------------------------------------------------------------- bug metadata
+def bug_meta(results_dir):
+    """(pid, bid, fixed_version, project_dir) from the results dir name + commit-db."""
+    name = os.path.basename(os.path.abspath(results_dir))
+    pid, bid = name.rsplit("-", 1)
+    pdir = os.path.join(FW_ROOT, "projects", pid)
+    with open(os.path.join(pdir, "commit-db")) as fh:
+        for line in fh:
+            if line.startswith(f"{bid},"):
+                return pid, bid, line.split(",")[2], pdir
+    raise SystemExit(f"bug {name} not in {pdir}/commit-db")
+
+
+def source_tarball(version):
+    cache = os.path.join(REPO_ROOT, "results", ".cache")
+    os.makedirs(cache, exist_ok=True)
+    tgz = os.path.join(cache, f"haproxy-{version}.tar.gz")
+    if not os.path.exists(tgz):
+        br = version.rsplit(".", 1)[0]
+        url = f"https://www.haproxy.org/download/{br}/src/haproxy-{version}.tar.gz"
+        log(f"downloading {url}")
+        urllib.request.urlretrieve(url, tgz)
+    return tgz
+
+
+# ---------------------------------------------------------------- selection
+def select_lines(spectrum, F, args):
+    cands = [(e, s) for e, s in spectrum.items() if s[0] == F]
+    if args.files:
+        rx = re.compile(args.files)
+        cands = [(e, s) for e, s in cands if rx.search(e[0])]
+    cands.sort(key=lambda x: (x[1][1], x[0][0], x[0][1]))          # ep asc, then file, line
+    if not args.all:
+        cands = cands[: args.top]
+    return [e for e, _ in cands]
+
+
+# ---------------------------------------------------------------- build
+def build_image(pid, bid, version, pdir, files, args, out_dir):
+    recipe = b"".join(open(os.path.join(HERE, f), "rb").read() for f in ("Dockerfile.bug", "mutrun.sh", "haproxy-wrapper.sh"))
+    cfg = hashlib.sha1(f"{LLVM}|{VERSIONS['MULL_VERSION']}|{args.mutators}|{','.join(sorted(files))}|".encode()
+                       + recipe).hexdigest()[:8]
+    tag = f"cvebench-mbfl:{pid}-{bid}-{cfg}"
+    if not args.rebuild and sh(["docker", "image", "inspect", tag]).returncode == 0:
+        log(f"reusing image {tag}")
+        return tag
+    ctx = os.path.join(out_dir, "build-ctx")
+    shutil.rmtree(ctx, ignore_errors=True)
+    os.makedirs(ctx)
+    shutil.copy(source_tarball(version), os.path.join(ctx, "haproxy-src.tar.gz"))
+    shutil.copy(os.path.join(pdir, "patches", f"{bid}.fix.patch"), os.path.join(ctx, "fix.patch"))
+    shutil.copy(os.path.join(pdir, "tests", bid, "trigger.vtc"), os.path.join(ctx, "trigger.vtc"))
+    shutil.copy(os.path.join(HERE, "mutrun.sh"), os.path.join(ctx, "mutrun.sh"))
+    shutil.copy(os.path.join(HERE, "haproxy-wrapper.sh"), os.path.join(ctx, "haproxy-wrapper.sh"))
+    shutil.copy(os.path.join(HERE, "Dockerfile.bug"), os.path.join(ctx, "Dockerfile"))
+    with open(os.path.join(ctx, "mull.yml"), "w") as fh:
+        fh.write("quiet: true\n")
+        fh.write("junkDetectionDisabled: true\n")   # no compile_commands.json for HAProxy; IR-level mutants are real behaviour changes anyway
+        fh.write("mutators:\n" + "".join(f"  - {m}\n" for m in args.mutators.split(",")))
+        fh.write("includePaths:\n" + "".join(f"  - {re.escape(f)}$\n" for f in sorted(files)))
+    extra = ""
+    env_file = os.path.join(pdir, "tests", bid, "build.env")
+    if os.path.exists(env_file):
+        for line in open(env_file):
+            if line.startswith("EXTRA_MAKE="):
+                extra = line.split("=", 1)[1].strip().strip('"')
+    log(f"building {tag} (haproxy {version}, clang-{LLVM} + Mull, {len(files)} file(s) mutated: {', '.join(sorted(files))})")
+    with open(os.path.join(out_dir, "build.log"), "w") as logf:
+        r = subprocess.run(["docker", "build", "--build-arg", f"BASE_IMAGE={BASE_IMAGE}",
+                            "--build-arg", f"LLVM={LLVM}", "--build-arg", f"HAPROXY_VERSION={version}",
+                            "--build-arg", f"EXTRA_MAKE={extra}", "-t", tag, ctx],
+                           stdout=logf, stderr=subprocess.STDOUT)
+    if r.returncode != 0:
+        raise SystemExit(f"image build failed — see {out_dir}/build.log")
+    return tag
+
+
+def list_mutants(tag):
+    """[(identifier, file, line, mutator, replacement)] baked into the image."""
+    r = sh(["docker", "run", "--rm", tag, "cat", "/build/mutants.txt"])
+    if r.returncode != 0:
+        raise SystemExit("cannot read /build/mutants.txt from the image: " + r.stderr)
+    out, seen = [], set()
+    for line in r.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) < 7:
+            continue
+        ident = ":".join(parts[:6])
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append((ident, fl.norm(parts[1]), int(parts[2]), parts[0], ":".join(parts[6:])))
+    return out
+
+
+# ---------------------------------------------------------------- execution
+def run_tests(tag, src, vtcs, timeout, env_name=None):
+    """Run the given vtc files in one container; returns {test_id: outcome}."""
+    cmd = ["docker", "run", "--rm", "-i"]
+    if env_name:
+        cmd += ["-e", f"MULL_MUTANT={env_name}"]     # the in-image haproxy wrapper turns this into "<id>=1"
+    cmd += [tag, "bash", "/mutrun.sh", src, str(timeout)]
+    r = subprocess.run(cmd, input="\n".join(vtcs) + "\n", capture_output=True, text=True,
+                       timeout=timeout * (len(vtcs) + 1) + 120)
+    res = {}
+    for line in r.stdout.splitlines():
+        p = line.split()
+        if len(p) >= 3:
+            res[p[0]] = f"{p[1]}:{p[2]}"          # "pass:-", "fail:<sig>", "timeout:timeout"
+    return res
+
+
+# ---------------------------------------------------------------- scoring
+def op2(spectrum):
+    """Op2 SBFL score per line, normalised to [0,1) — used only to break MBFL ties."""
+    P = max((s[1] + s[3] for s in spectrum.values()), default=0)
+    raw = {e: s[0] - s[1] / (P + 1) for e, s in spectrum.items()}
+    lo, hi = min(raw.values()), max(raw.values())
+    span = (hi - lo) or 1.0
+    return {e: 0.999 * (v - lo) / span for e, v in raw.items()}
+
+
+def score(spectrum, F, P, failing, passing, mutants, results, baseline):
+    """mutants: [(ident, file, line, ...)]; results: {ident: {test: "outcome:sig"}}.
+
+    Kill notions (per mutant m):
+      fP(m)  failing tests that PASS on m                      (strict, MUSE's f->p)
+      fX(m)  failing tests whose result CHANGES on m — pass, or a different
+             failure signature / timeout                       (Metallaxis: "test result differs")
+      pF(m)  passing tests that no longer pass on m            (p->f)
+    """
+    fset, pset = set(failing), set(passing)
+    per_mut = {}
+    for ident, f, ln, *_ in mutants:
+        r = results.get(ident, {})
+        fP = {t for t, oc in r.items() if t in fset and oc.startswith("pass")}
+        fX = {t for t, oc in r.items() if t in fset and oc != baseline[t]}
+        pF = {t for t, oc in r.items() if t in pset and oc != baseline[t]}
+        per_mut[ident] = (fP, pF, fX)
+    by_line = {}
+    for ident, f, ln, *_ in mutants:
+        by_line.setdefault((f, ln), []).append(ident)
+    f2p = sum(len(v[0]) for v in per_mut.values())
+    p2f = sum(len(v[1]) for v in per_mut.values())
+    f2x = sum(len(v[2]) for v in per_mut.values())
+
+    def metallaxis(formula):                       # kill = result differs (fX / pF); line = max over its mutants
+        sc = {}
+        for line, ids in by_line.items():
+            best = 0.0
+            for i in ids:
+                ef, ep = len(per_mut[i][2]), len(per_mut[i][1])
+                if formula == "ochiai":
+                    d = math.sqrt(F * (ef + ep)); s = ef / d if d else 0.0
+                else:                               # dstar (*=2)
+                    d = ep + (F - ef); s = (ef * ef) / d if d else (float("inf") if ef else 0.0)
+                best = max(best, s)
+            sc[line] = best
+        return sc
+
+    def muse(strict=True):                          # Moon et al. 2014; strict = f->p only, impact = fX
+        k = 0 if strict else 2
+        tot_f = f2p if strict else f2x
+        sc = {}
+        for line, ids in by_line.items():
+            tot = 0.0
+            for i in ids:
+                a = len(per_mut[i][k]) / tot_f if tot_f else 0.0
+                b = len(per_mut[i][1]) / p2f if p2f else 0.0
+                tot += a - b
+            sc[line] = tot / len(ids)
+        return sc
+
+    tb = op2(spectrum)
+    rankings = {}
+    for name, sc in (("metallaxis_ochiai", metallaxis("ochiai")), ("metallaxis_dstar", metallaxis("dstar")),
+                     ("muse", muse(True)), ("muse_impact", muse(False))):
+        floor = min(sc.values(), default=0.0) - 1.0         # unmutated lines: below every mutated line, tied
+        scored = [(e, sc.get(e, floor)) for e in spectrum]
+        scored.sort(key=lambda x: (-x[1], x[0][0], x[0][1]))
+        rankings[name] = scored
+        # same ranking with ties broken by the line's Op2 SBFL score (hybrid MBFL+SBFL)
+        scored_tb = [(e, s + 1e-9 * tb[e]) for e, s in scored]
+        scored_tb.sort(key=lambda x: (-x[1], x[0][0], x[0][1]))
+        rankings[name + "_op2tb"] = scored_tb
+    stats = {"mutants": len(mutants), "lines_mutated": len(by_line), "f2p": f2p, "f2x": f2x, "p2f": p2f,
+             "killed_by_failing_strict": sum(1 for v in per_mut.values() if v[0]),
+             "impacting_failing": sum(1 for v in per_mut.values() if v[2]),
+             "killed_by_passing": sum(1 for v in per_mut.values() if v[1])}
+    return rankings, per_mut, stats
+
+
+# ---------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("results")
+    ap.add_argument("-o", "--out-dir", default=None)
+    ap.add_argument("--top", type=int, default=300, help="candidate lines to mutate (ep-ascending order)")
+    ap.add_argument("--all", action="store_true", help="mutate every line executed by all failing tests")
+    ap.add_argument("--files", default=None, help="regex: restrict candidate lines to matching files")
+    ap.add_argument("--mutators", default="cxx_default", help="Mull mutator ids/groups, comma-separated")
+    ap.add_argument("--max-mutants", type=int, default=0, help="random sample of mutants (0 = all)")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("--timeout", type=int, default=30, help="seconds per test run")
+    ap.add_argument("--rebuild", action="store_true")
+    ap.add_argument("--skip-run", action="store_true", help="build + list mutants only")
+    ap.add_argument("--metric", action="append", default=None, help=argparse.SUPPRESS)  # cvebench fl -f passthrough
+    ap.add_argument("--top-print", type=int, default=15)
+    args = ap.parse_args()
+
+    if sh(["docker", "image", "inspect", BASE_IMAGE]).returncode != 0:
+        raise SystemExit(f"base image {BASE_IMAGE} missing — run cvebench prepare -t mbfl")
+    out_dir = args.out_dir or os.path.join(args.results, "fl", "mbfl")
+    os.makedirs(out_dir, exist_ok=True)
+    pid, bid, version, pdir = bug_meta(args.results)
+    src = f"/build/haproxy-{version}"
+
+    spectrum, failing, passing = fl.build_spectrum(args.results)
+    F, P = len(failing), len(passing)
+    gt = fl.load_ground_truth(args.results)
+    tests = {t["name"]: t for t in json.load(open(os.path.join(args.results, "tests.json")))}
+    vtc_of = {}
+    for line in open(os.path.join(args.results, "buggy", "outcomes.txt")):
+        p = line.split()
+        if len(p) >= 3:
+            vtc_of[p[0]] = p[2]
+    cover = {t: fl.load_coverage(os.path.join(args.results, tests[t]["coverage"])) for t in tests}
+
+    lines = select_lines(spectrum, F, args)
+    files = sorted({f for f, _ in lines})
+    log(f"{pid}-{bid}: {len(spectrum)} lines, {F} failing / {P} passing tests; "
+        f"candidates: {sum(1 for s in spectrum.values() if s[0] == F)} lines executed by all failing tests, "
+        f"selected {len(lines)} in {len(files)} file(s)")
+    if gt:
+        log(f"ground truth in selection: {[e for e in gt['lines'] if e in set(lines)]}")
+
+    tag = build_image(pid, bid, version, pdir, files, args, out_dir)
+    all_muts = list_mutants(tag)
+    sel = set(lines)
+    mutants = [m for m in all_muts if (m[1], m[2]) in sel]
+    if args.max_mutants and len(mutants) > args.max_mutants:
+        random.Random(args.seed).shuffle(mutants)
+        mutants = sorted(mutants[: args.max_mutants])
+    log(f"mutants in image: {len(all_muts)}; on selected lines: {len(mutants)}")
+    json.dump({"selection": {"top": args.top, "all": args.all, "files": args.files, "mutators": args.mutators,
+                             "lines": [list(e) for e in lines]},
+               "image": tag, "mutants": [{"id": m[0], "file": m[1], "line": m[2], "mutator": m[3], "replacement": m[4]} for m in mutants]},
+              open(os.path.join(out_dir, "selection.json"), "w"), indent=1)
+    if args.skip_run:
+        return
+
+    # ---- baseline on the unmutated clang build
+    t0 = time.time()
+    names = [t for t in tests if t in vtc_of]
+    base = run_tests(tag, src, [vtc_of[t] for t in names], args.timeout)
+    baseline, unstable = {}, []
+    for t in names:
+        exp = "fail" if tests[t]["outcome"] == "fail" else "pass"
+        got = base.get(t, "missing:missing")
+        oc = "fail" if got.startswith("timeout") else got.split(":")[0]
+        if oc == exp:
+            baseline[t] = got                        # "pass:-" or "fail:<signature>"
+        else:
+            unstable.append((t, exp, got))
+    log(f"baseline: {len(baseline)}/{len(names)} tests reproduce tests.json outcomes ({time.time()-t0:.0f}s)"
+        + (f"; dropped unstable: {unstable}" if unstable else ""))
+    if not any(tests[t]["outcome"] == "fail" for t in baseline):
+        raise SystemExit("no failing test reproduces on the Mull build — cannot localize")
+    failing = [t for t in failing if t in baseline]
+    passing = [t for t in passing if t in baseline]
+    F, P = len(failing), len(passing)
+
+    # ---- per-mutant runs (only tests covering the mutated line)
+    jobs = []
+    for m in mutants:
+        ts = [t for t in baseline if (m[1], m[2]) in cover[t]]
+        jobs.append((m, ts))
+    total_runs = sum(len(ts) for _, ts in jobs)
+    log(f"running {len(jobs)} mutants x covering tests = {total_runs} test executions, {args.jobs} containers in parallel")
+    results, done, t0 = {}, 0, time.time()
+
+    def work(job):
+        m, ts = job
+        if not ts:
+            return m[0], {}
+        try:
+            r = run_tests(tag, src, [vtc_of[t] for t in ts], args.timeout, env_name=m[0])
+        except subprocess.TimeoutExpired:
+            r = {}
+        return m[0], {t: r.get(t, "timeout:timeout") for t in ts}
+
+    with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        for ident, r in ex.map(work, jobs):
+            results[ident] = r
+            done += 1
+            if done % 25 == 0 or done == len(jobs):
+                el = time.time() - t0
+                log(f"  {done}/{len(jobs)} mutants ({el:.0f}s, eta {el/done*(len(jobs)-done):.0f}s)")
+
+    rankings, per_mut, stats = score(spectrum, F, P, failing, passing, mutants, results, baseline)
+    log(f"kill matrix: {stats}")
+    json.dump({"image": tag, "baseline": baseline, "unstable": unstable, "stats": stats,
+               "mutants": [{"id": m[0], "file": m[1], "line": m[2], "mutator": m[3], "replacement": m[4],
+                            "tests": results.get(m[0], {}),
+                            "f2p": sorted(per_mut[m[0]][0]), "f2x": sorted(per_mut[m[0]][2]),
+                            "p2f": sorted(per_mut[m[0]][1])} for m in mutants]},
+              open(os.path.join(out_dir, "mutants.json"), "w"), indent=1)
+
+    print(f"# MBFL  results={args.results}  image={tag}")
+    print(f"#   failing tests ({F}): {', '.join(failing)}")
+    print(f"#   passing tests ({P}): {', '.join(passing)}")
+    print(f"#   mutants: {stats['mutants']} on {stats['lines_mutated']} lines; "
+          f"f2p={stats['f2p']} (strict) f2x={stats['f2x']} (failing result changed) p2f={stats['p2f']}")
+    if gt:
+        print(f"#   ground-truth lines: {sorted(gt['lines'])}")
+    print()
+    by_line = {}
+    for m in mutants:
+        by_line.setdefault((m[1], m[2]), []).append(m[0])
+
+    def detail(e):
+        ids = by_line.get(e)
+        if not ids:
+            return "(not mutated)"
+        return (f"(mutants={len(ids)} f2p={max(len(per_mut[i][0]) for i in ids)} "
+                f"f2x={max(len(per_mut[i][2]) for i in ids)} p2f={min(len(per_mut[i][1]) for i in ids)})")
+
+    formulas = {name: fl.report(name, scored, gt, args.top_print, detail) for name, scored in rankings.items()}
+    for f in formulas.values():
+        f["stats"] = stats
+    fl.write_ranking(out_dir, "mbfl", failing, passing, len(spectrum), formulas)
+
+
+if __name__ == "__main__":
+    main()

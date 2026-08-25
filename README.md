@@ -29,8 +29,15 @@ framework/
 │   ├── cvebench-coverage     # per-test coverage collector (kind + vtest)
 │   ├── gtdiff.py             # buggy↔fixed diff → exact line-level ground truth
 │   ├── assemble.py           # classify suite → GZoltar spectra/matrix/tests
-│   └── sbfl-rank             # Ochiai/Tarantula/Jaccard/DStar + EXAM
+│   └── sbfl-rank             # built-in SBFL: Ochiai/Tarantula/Jaccard/D*/Op2/Barinel/GP13/Kulczynski2/Ample + EXAM
 ├── lib/cvebench.sh           # commit-db + kind-cluster helpers
+├── lib/flcommon.py           # shared FL helpers: spectrum, ground truth, rank/EXAM scoring, ranking.json
+├── tools/<tool>/             # external FL/APR tool adapters (prepare.sh + run), host-native, no docker
+│   ├── flitsr/               # FLITSR / FLITSR* (ISSTA 2023) over the GZoltar spectrum
+│   ├── mbfl/                 # mutation-based FL: Mull mutants + Metallaxis / MUSE
+│   ├── llmao/                # LLMAO (ICSE 2024): test-free LLM fault localization
+│   ├── autofl/               # AutoFL (FSE 2024): LLM agent with code-navigation tools, ported to C
+│   └── oracle/               # reference APR adapter (upstream fix + empty patch)
 └── projects/haproxy/
     ├── commit-db             # bid,cve,fixed_version,fix_commit,cwe,cvss,summary
     ├── patches/<bid>.fix.patch
@@ -65,16 +72,46 @@ $cvebench test    -p haproxy -b 3                # buggy: trigger FAILS (reprodu
 
 ### Fault localization
 ```bash
-$cvebench coverage -p haproxy -b 3               # per-test coverage + classify + rank
-$cvebench sbfl     -p haproxy -b 3               # re-rank; $cvebench summary for the table
+$cvebench coverage -p haproxy -b 3               # per-test coverage + classify + built-in SBFL rank
+$cvebench fl       -p haproxy -b 3               # re-rank with the built-in SBFL (= cvebench sbfl)
+$cvebench fl       -p haproxy -b 3 -f op2        # a single formula
+$cvebench tools                                  # external FL tools and whether they are prepared
+$cvebench prepare  -t flitsr                     # one-off: venv + pip under framework/tools/flitsr/
+$cvebench fl       -p haproxy -b 3 -t flitsr     # FLITSR / FLITSR* on the same spectrum
+$cvebench prepare  -t mbfl                       # one-off: Debian + clang + Mull + vtest base image
+$cvebench fl       -p haproxy -b 3 -t mbfl -- --top 300   # mutation-based FL (Metallaxis, MUSE)
+$cvebench prepare  -t llmao                      # one-off: venv with torch/transformers + LLMAO checkpoints
+$cvebench fl       -p haproxy -b 3 -t llmao -- --model 6B  # LLM-based, test-free FL (GPU recommended)
+$cvebench prepare  -t autofl                     # one-off: venv with openai client + tree-sitter
+OPENAI_BASE_URL=http://127.0.0.1:8080/v1 OPENAI_API_KEY=none AUTOFL_MODEL=<name> \
+$cvebench fl       -p haproxy -b 3 -t autofl     # LLM agent FL (any OpenAI-compatible endpoint), R=5 runs
+$cvebench summary  [-t flitsr] [-f ochiai]       # bug x tool x formula: fault rank + EXAM
 ```
+
+Every FL tool writes `results/<pid>-<bid>/fl/<tool>/ranking.json` (schema in
+`framework/lib/flcommon.py`), scored against `ground_truth.json` with the same
+rank / EXAM code, so tools are directly comparable. External tools live under
+`framework/tools/<tool>/` with a `prepare.sh` that installs everything they need
+into a private, git-ignored venv — no host-specific dependencies and no
+dedicated container; see `framework/tools/README.md` for the adapter contract.
 
 ### Automated program repair (patch generation)
 ```bash
 $cvebench checkout -p haproxy -b 3 -v buggy -w /tmp/wd   # buggy source in a workdir
 #   ... an APR tool edits /tmp/wd/haproxy-2.8.2/... ...
-$cvebench compile -p haproxy -b 3 && $cvebench test -p haproxy -b 3   # evaluate the candidate
+$cvebench diff     -w /tmp/wd > cand.patch               # export the edits as a patch -p1 diff
+$cvebench validate -p haproxy -b 3 --patch cand.patch -t mytool   # buggy+candidate: trigger + relevant tests
+#   -> results/haproxy-3/apr/mytool/cand/validation.json  (plausible = compiles & triggers pass & no relevant fails)
+$cvebench apr      -p haproxy -b 3 -t oracle             # adapter-driven: checkout -> tool emits candidates -> validate each
+$cvebench summary                                        # FL table + APR table
 ```
+
+## Integrating your own FL / APR tool
+
+The tool contract (adapter layout, `cvebench` verbs as an API, file schemas,
+validation semantics, portability rules) is specified in
+**[docs/INTEGRATION.md](docs/INTEGRATION.md)**. Reference adapters:
+`framework/tools/flitsr` (FL) and `framework/tools/oracle` (APR).
 
 ## Bugs
 

@@ -1,0 +1,8 @@
+{
+  "name": "mbfl",
+  "kind": "fl",
+  "description": "Mutation-based FL (Metallaxis, MUSE) with Mull mutants of the buggy program, killed by the bug's reg-tests",
+  "reference": "M. Papadakis, Y. Le Traon. Metallaxis-FL: mutation-based fault localization. STVR 25(5), 2015; S. Moon, Y. Kim, M. Kim, S. Yoo. Ask the Mutants: Mutating Faulty Programs for Fault Localization. ICST 2014; A. Denisov, S. Pankevich. Mull it over: mutation testing based on LLVM. ICSTW 2018.",
+  "url": "https://github.com/mull-project/mull",
+  "granularity": "line"
+}

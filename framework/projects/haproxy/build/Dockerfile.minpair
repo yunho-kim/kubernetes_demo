@@ -21,6 +21,8 @@ ARG HAPROXY_VERSION
 ARG VARIANT=fixed
 ARG FIX_PATCH
 ARG EXTRA_MAKE=
+# APR: an optional candidate patch applied on top of the variant (cvebench validate)
+ARG CANDIDATE_PATCH=build/empty.patch
 WORKDIR /build
 RUN BR="$(echo "$HAPROXY_VERSION" | cut -d. -f1,2)" \
     && wget -q "https://www.haproxy.org/download/${BR}/src/haproxy-${HAPROXY_VERSION}.tar.gz" \
@@ -32,6 +34,9 @@ WORKDIR /build/haproxy-${HAPROXY_VERSION}
 RUN if [ "$VARIANT" = "buggy" ]; then \
         echo "== reverse-applying fix to create BUGGY ==" && patch -R -p1 < /tmp/fix.patch ; \
     else echo "== FIXED variant (no patch) ==" ; fi
+COPY "$CANDIDATE_PATCH" /tmp/candidate.patch
+RUN if [ -s /tmp/candidate.patch ]; then \
+        echo "== applying CANDIDATE patch ==" && patch -p1 --no-backup-if-mismatch < /tmp/candidate.patch ; fi
 RUN make -j"$(nproc)" TARGET=linux-glibc \
         USE_OPENSSL= USE_PCRE= USE_PCRE2= USE_ZLIB= USE_LUA= USE_SYSTEMD= \
         CPU_CFLAGS="-O0" \

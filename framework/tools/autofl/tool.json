@@ -1,0 +1,8 @@
+{
+  "name": "autofl",
+  "kind": "fl",
+  "description": "AutoFL: LLM agent that inspects the failing test and calls code-navigation functions (covered files/functions, code, comments) to name culprit functions; R runs are combined by voting",
+  "reference": "S. Kang, G. An, S. Yoo. A Quantitative and Qualitative Evaluation of LLM-Based Explainable Fault Localization. FSE 2024.",
+  "url": "https://github.com/coinse/autofl",
+  "granularity": "function"
+}

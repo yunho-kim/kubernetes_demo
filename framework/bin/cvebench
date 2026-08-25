@@ -11,25 +11,44 @@
 #   cvebench compile  -p <pid> -b <bid>                                  # build coverage images
 #   cvebench test     -p <pid> -b <bid> [-v <buggy|fixed>]              # run trigger (reproduce CVE)
 #   cvebench coverage -p <pid> -b <bid>                                  # per-test coverage + classify
-#   cvebench sbfl     -p <pid> -b <bid>                                  # rank suspicious lines
-#   cvebench summary  | cvebench clean
+#   cvebench fl       -p <pid> -b <bid> [-t <tool>] [-f <formula>] [-- <tool args>]
+#                                                                        # fault localization (default tool: sbfl)
+#   cvebench sbfl     -p <pid> -b <bid>                                  # = fl -t sbfl
+#   cvebench prepare  -t <tool>                                          # install an external tool (framework/tools/<tool>)
+#   cvebench diff     -w <workdir>                                       # APR: edits in a checkout -> unified diff (stdout)
+#   cvebench validate -p <pid> -b <bid> (--patch <diff> | -w <workdir>) [-t <tool>] [--id <name>] [--full]
+#                                                                        # APR: build buggy+candidate, run trigger+relevant tests
+#   cvebench apr      -p <pid> -b <bid> -t <tool> [-w <workdir>] [-- <tool args>]
+#                                                                        # APR: checkout -> tool emits candidates -> validate each
+#   cvebench tools    | cvebench summary [-t <tool>] [-f <formula>] | cvebench clean
+#
+# Tool integration contract (FL and APR): docs/INTEGRATION.md
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../lib/cvebench.sh"
+TOOLS_ROOT="$FW_ROOT/tools"
 
 # ---- arg parsing ----
-PID="" BID="" VAR="" WD="" Q=""
+PID="" BID="" VAR="" WD="" Q="" TOOL="" FORMULA="" PATCH="" CAND_ID="" FULL="" EXTRA=()
 args() { while [[ $# -gt 0 ]]; do case "$1" in
   -p) PID="$2"; shift 2;; -b) BID="$2"; shift 2;; -v) VAR="$2"; shift 2;;
-  -w) WD="$2"; shift 2;; -q) Q="$2"; shift 2;; *) shift;; esac; done; }
+  -w) WD="$2"; shift 2;; -q) Q="$2"; shift 2;; -t) TOOL="$2"; shift 2;;
+  -f) FORMULA="$2"; shift 2;; --patch) PATCH="$2"; shift 2;; --id) CAND_ID="$2"; shift 2;;
+  --full) FULL=1; shift;; --) shift; EXTRA=("$@"); break;; *) shift;; esac; done; }
 need() { for v; do [[ -n "${!v}" ]] || die "missing -${v:0:1} (need $*)"; done; }
 results_dir() { printf '%s/%s-%s' "$RESULTS_ROOT" "$PID" "$BID"; }
+fl_dir() { printf '%s/fl/%s' "$(results_dir)" "$1"; }     # <tool>
+apr_dir() { printf '%s/apr/%s' "$(results_dir)" "$1"; }   # <tool>
+list_tools() { { echo sbfl; find "$TOOLS_ROOT" -mindepth 2 -maxdepth 2 -name run -printf '%h\n' | xargs -rn1 basename; } | sort -u; }
+tool_kind() { [[ "$1" == sbfl ]] && { echo fl; return; }
+  python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("kind","fl"))' "$TOOLS_ROOT/$1/tool.json" 2>/dev/null || echo fl; }
 
 # ---- helpers ----
-src_tarball() { # <fixver> <dest_dir>   download + extract haproxy source
-  local v="$1" d="$2" br="${1%.*}"
-  mkdir -p "$d"; ( cd "$d" && wget -q "https://www.haproxy.org/download/${br}/src/haproxy-${v}.tar.gz" \
-    && tar xzf "haproxy-${v}.tar.gz" && rm -f "haproxy-${v}.tar.gz" )
+src_tarball() { # <fixver> <dest_dir>   download (cached under results/.cache) + extract haproxy source
+  local v="$1" d="$2" br="${1%.*}" cache="$RESULTS_ROOT/.cache" tgz="haproxy-$1.tar.gz"
+  mkdir -p "$d" "$cache"
+  [[ -s "$cache/$tgz" ]] || wget -q -O "$cache/$tgz" "https://www.haproxy.org/download/${br}/src/$tgz" || die "download failed: $tgz"
+  tar xzf "$cache/$tgz" -C "$d"
 }
 
 # ====================================================================
@@ -52,12 +71,19 @@ cmd_info() { need PID BID
   printf 'fixed release: %s   fix commit: %s\n' "$(bug_fixedver "$PID" "$BID")" "$(bug_fixcommit "$PID" "$BID")"
   printf 'buggy        : fixed release with patches/%s.fix.patch reverse-applied\n' "$BID"
   printf 'modified     : %s\n' "$(bug_modified_files "$PID" "$BID" | tr '\n' ' ')"
-  local rj; rj="$(results_dir)/ranking.json"
-  [[ -f "$rj" ]] && python3 - "$rj" <<'PY' || printf 'result       : (not run — cvebench coverage)\n'
-import json,sys
-d=json.load(open(sys.argv[1])); o=d["formulas"]["ochiai"]; fr=o.get("fault_rank")
+  python3 - "$(results_dir)" <<'PY'
+import glob,json,os,sys
+r=sys.argv[1]; files=sorted(glob.glob(os.path.join(r,"fl","*","ranking.json")))
+if not files: print("result       : (not run — cvebench coverage; cvebench fl)"); sys.exit()
+d=json.load(open(files[0]))
 print("tests (f/p)  : %d / %d   components: %d" % (len(d["failing"]),len(d["passing"]),d["n_lines"]))
-if fr: print("fault rank   : %s%s of %d   (Ochiai, EXAM %.4f)"%(fr[0],""if fr[1]==fr[0] else f"-{fr[1]}",fr[2],o["exam"]))
+for p in files:
+    d=json.load(open(p)); fs=d["formulas"]
+    # headline formula: ochiai (or the first ochiai-based variant), else the first
+    key=next((k for k in ("ochiai",)+tuple(fs) if k in fs and "ochiai" in k), next(iter(fs)))
+    o=fs[key]; fr=o.get("fault_rank")
+    rank=("%s%s of %d   EXAM %.4f"%(fr[0],""if fr[1]==fr[0] else f"-{fr[1]}",fr[2],o["exam"])) if fr else "NOT FOUND"
+    print("fl/%-10s : %s   (%s; %d formula%s)"%(d.get("tool",os.path.basename(os.path.dirname(p))),rank,key,len(fs),"s" if len(fs)>1 else ""))
 PY
 }
 
@@ -112,31 +138,160 @@ cmd_test() { need PID BID
 }
 
 cmd_coverage() { need PID BID; "$HERE/cvebench-coverage" "$PID" "$BID"; }
-cmd_sbfl() { need PID BID
-  python3 "$HERE/sbfl-rank" -r "$(results_dir)" --top 15 --json-out "$(results_dir)/ranking.json"; }
 
-cmd_summary() {
-  python3 - "$RESULTS_ROOT" <<'PY'
+# ---- tools: built-in sbfl + adapters under framework/tools/<tool>/ (docs/INTEGRATION.md) ----
+cmd_tools() { printf '%-10s %-4s %-14s %s\n' tool kind status description
+  for t in $(list_tools); do
+    local st desc
+    if [[ "$t" == sbfl ]]; then st=built-in; desc="Ochiai/Tarantula/Jaccard/D*/Op2/Barinel/GP13/Kulczynski2/Ample (framework/bin/sbfl-rank)"
+    elif [[ ! -x "$TOOLS_ROOT/$t/prepare.sh" ]]; then st=ready
+    elif [[ -d "$TOOLS_ROOT/$t/.venv" ]]; then st=prepared
+    else st="NOT prepared"; fi
+    [[ "$t" == sbfl ]] || desc="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("description",""))' "$TOOLS_ROOT/$t/tool.json" 2>/dev/null || true)"
+    printf '%-10s %-4s %-14s %s\n' "$t" "$(tool_kind "$t")" "$st" "$desc"
+  done; }
+
+cmd_prepare() { need TOOL
+  local p="$TOOLS_ROOT/$TOOL/prepare.sh"
+  [[ "$TOOL" == sbfl ]] && { log "sbfl is built in; nothing to prepare"; return; }
+  [[ -x "$TOOLS_ROOT/$TOOL/run" ]] || die "no such tool: $TOOL (have: $(list_tools | tr '\n' ' '))"
+  [[ -x "$p" ]] || { log "$TOOL has no prepare.sh; nothing to prepare"; return; }
+  log "preparing $TOOL"; "$p" "${EXTRA[@]}"; }
+
+# ---- APR: candidate-patch validation (buggy + candidate -> trigger + relevant tests) ----
+cand_id() { sha1sum "$1" | cut -c1-8; }
+
+cmd_diff() { need WD   # edits in a checkout vs the pristine version -> unified diff (patch -p1) on stdout
+  local pid bid var; read -r pid bid var < "$WD/cvebench.bug" || die "not a cvebench checkout: $WD"
+  local v tmp; v="$(bug_fixedver "$pid" "$bid")"; tmp="$(mktemp -d)"
+  src_tarball "$v" "$tmp/pristine"
+  [[ "$var" == buggy ]] && ( cd "$tmp/pristine/haproxy-$v" && patch -R -p1 < "$(proj_dir "$pid")/patches/$bid.fix.patch" >/dev/null )
+  ln -s "$tmp/pristine/haproxy-$v" "$tmp/a"; ln -s "$(cd "$WD" && pwd)/haproxy-$v" "$tmp/b"
+  ( cd "$tmp" && diff -ruN -x '*.o' -x '*.d' -x '*.a' -x '*.so' -x haproxy -x '.*' a b | grep -v '^diff -ruN ' ) || true
+  rm -rf "$tmp"
+}
+
+# validate_patch <candidate.patch> <tool> <id>  ->  results/<bug>/apr/<tool>/<id>/{candidate.patch,build.log,outcomes.txt,validation.json}
+validate_patch() { local patch="$1" tool="$2" id="$3"
+  local out ctx v tag cand src compiles=true
+  out="$(apr_dir "$tool")/$id"; ctx="$(proj_dir "$PID")"; v="$(bug_fixedver "$PID" "$BID")"; src="$(bug_srcdir "$PID" "$BID")"
+  mkdir -p "$out"; cp "$patch" "$out/candidate.patch"
+  [[ -f "$ctx/tests/$BID/build.env" ]] && source "$ctx/tests/$BID/build.env"
+  tag="cvebench:$PID-$BID-cand-$(cand_id "$patch")"; cand="build/.candidate-$(cand_id "$patch").patch"
+  cp "$patch" "$ctx/$cand"
+  log "validate $PID-$BID <- $tool/$id ($(grep -c '^[-+]' "$patch" || true) diff lines): building $tag"
+  docker build --build-arg "HAPROXY_VERSION=$v" --build-arg VARIANT=buggy \
+    --build-arg "FIX_PATCH=patches/$BID.fix.patch" --build-arg "EXTRA_MAKE=${EXTRA_MAKE:-}" \
+    --build-arg "CANDIDATE_PATCH=$cand" -t "$tag" -f "$ctx/build/Dockerfile.minpair" "$ctx" \
+    > "$out/build.log" 2>&1 || compiles=false
+  rm -f "$ctx/$cand"
+  : > "$out/outcomes.txt"
+  if $compiles; then
+    local mode=relevant; [[ -n "$FULL" ]] && mode=full
+    log "running trigger + $mode tests in $tag"
+    grep -vE '^\s*#|^\s*$' "$ctx/tests/$BID/regtests.txt" > "$out/globs.txt"
+    cat "$ctx/trigger_tests/$BID" "$ctx/relevant_tests/$BID" 2>/dev/null | sort -u > "$out/relevant.txt"
+    docker run --rm --cap-add=SYS_PTRACE \
+      -v "$ctx/build/runsuite.sh:/runsuite.sh:ro" -v "$ctx/build/validate.sh:/validate.sh:ro" \
+      -v "$ctx/tests/$BID/trigger.vtc:/trigger.vtc:ro" -v "$out/globs.txt:/globs.txt:ro" -v "$out/relevant.txt:/relevant.txt:ro" \
+      "$tag" bash /validate.sh "$src" "$mode" > "$out/outcomes.txt" 2>"$out/test.log" || true
+    [[ "${CVEBENCH_KEEP_IMAGES:-}" == 1 ]] || docker rmi "$tag" >/dev/null 2>&1 || true
+  else
+    warn "candidate does not compile (see $out/build.log)"
+  fi
+  python3 - "$out" "$PID-$BID" "$tool" "$id" "$compiles" "${FULL:+full}" "$ctx/trigger_tests/$BID" <<'PY'
 import json,os,sys
-root=sys.argv[1]; rows=[]
-for d in sorted(os.listdir(root)) if os.path.isdir(root) else []:
-    rj=os.path.join(root,d,"ranking.json")
-    if not os.path.exists(rj): continue
-    x=json.load(open(rj)); o=x["formulas"].get("ochiai",{}); fr=o.get("fault_rank")
-    rank=(f"{fr[0]}"+("" if fr[1]==fr[0] else f"-{fr[1]}")) if fr else "NOT FOUND"
-    rows.append((d,f"{len(x['failing'])}/{len(x['passing'])}",x.get("n_lines"),rank,
-                 f"{o.get('exam'):.4f}" if o.get("exam") is not None else "-"))
-w=max([len(r[0]) for r in rows]+[8]) if rows else 8
-print(f"{'bug':<{w}}  tests(f/p)  lines  ochiai-rank   EXAM"); print("-"*(w+38))
-for d,tp,nl,rank,exam in rows: print(f"{d:<{w}}  {tp:>9}  {str(nl):>5}  {rank:>11}   {exam}")
+out,bug,tool,cid,compiles,full,trigf=sys.argv[1:8]
+triggers=set(l.strip() for l in open(trigf)) if os.path.exists(trigf) else set()
+triggers.add("_sbfl_trigger_vtc")
+tests={}
+for line in open(os.path.join(out,"outcomes.txt")):
+    p=line.split()
+    if len(p)>=3: tests[p[0]]={"outcome":p[1],"vtc":p[2],"role":"trigger" if p[0] in triggers else "relevant"}
+tp=[t for t,x in tests.items() if x["role"]=="trigger" and x["outcome"]=="pass"]
+tt=[t for t,x in tests.items() if x["role"]=="trigger"]
+rf=[t for t,x in tests.items() if x["role"]!="trigger" and x["outcome"]=="fail"]
+plausible=compiles=="true" and bool(tt) and len(tp)==len(tt) and not rf
+v={"bug":bug,"tool":tool,"candidate":cid,"patch":"candidate.patch","compiles":compiles=="true",
+   "suite":"full" if full else "relevant","tests":tests,"trigger_pass":len(tp),"trigger_total":len(tt),
+   "relevant_fail":rf,"plausible":plausible}
+json.dump(v,open(os.path.join(out,"validation.json"),"w"),indent=2)
+print(f"  compiles={v['compiles']}  trigger {len(tp)}/{len(tt)} pass  relevant fail={len(rf)}  -> "+("PLAUSIBLE" if plausible else "not plausible"))
 PY
 }
 
-[[ $# -ge 1 ]] || die "usage: cvebench {pids|bids|info|export|checkout|compile|test|coverage|sbfl|summary|clean} ..."
+cmd_validate() { need PID BID
+  local patch="$PATCH" id tmp=""
+  [[ -n "$patch" || -n "$WD" ]] || die "need --patch <candidate.diff> or -w <workdir>"
+  if [[ -z "$patch" ]]; then tmp="$(mktemp)"; cmd_diff > "$tmp"; patch="$tmp"; fi
+  [[ -s "$patch" ]] || warn "candidate patch is empty"
+  id="${CAND_ID:-$( [[ -n "$tmp" ]] && echo "wd-$(cand_id "$patch")" || basename "${patch%.*}" )}"
+  validate_patch "$patch" "${TOOL:-manual}" "$id"
+  [[ -n "$tmp" ]] && rm -f "$tmp"; true; }
+
+cmd_apr() { need PID BID TOOL
+  [[ -x "$TOOLS_ROOT/$TOOL/run" ]] || die "no such tool: $TOOL (have: $(list_tools | tr '\n' ' '))"
+  [[ "$(tool_kind "$TOOL")" == apr ]] || die "$TOOL is not an APR tool (tool.json kind)"
+  local out wd; out="$(apr_dir "$TOOL")"; wd="${WD:-$out/workdir}"; mkdir -p "$out"
+  [[ -f "$wd/cvebench.bug" ]] || WD="$wd" VAR=buggy cmd_checkout
+  log "apr: $TOOL on $PID-$BID (workdir $wd)"
+  "$TOOLS_ROOT/$TOOL/run" "$(results_dir)" "$wd" -o "$out" "${EXTRA[@]}"
+  local n=0 c
+  for c in "$out"/candidates/*.patch; do
+    [[ -e "$c" ]] || continue; validate_patch "$c" "$TOOL" "$(basename "${c%.patch}")"; n=$((n+1))
+  done
+  log "apr: $TOOL produced $n candidate(s) -> $out/<candidate>/validation.json"; }
+
+cmd_fl() { need PID BID
+  local t="${TOOL:-sbfl}" r; r="$(results_dir)"
+  [[ -f "$r/tests.json" ]] || die "no coverage for $PID-$BID (cvebench coverage -p $PID -b $BID)"
+  log "fault localization: $t on $PID-$BID -> $(fl_dir "$t")"
+  if [[ "$t" == sbfl ]]; then
+    python3 "$HERE/sbfl-rank" -r "$r" --top 15 -o "$(fl_dir sbfl)" ${FORMULA:+--formula "$FORMULA"} "${EXTRA[@]}"
+  else
+    [[ -x "$TOOLS_ROOT/$t/run" ]] || die "no such tool: $t (have: $(list_tools | tr '\n' ' '))"
+    "$TOOLS_ROOT/$t/run" "$r" -o "$(fl_dir "$t")" ${FORMULA:+--metric "$FORMULA"} "${EXTRA[@]}"
+  fi; }
+cmd_sbfl() { TOOL=sbfl; cmd_fl; }
+
+cmd_summary() {
+  python3 - "$RESULTS_ROOT" "$TOOL" "$FORMULA" <<'PY'
+import glob,json,os,sys
+root,tool_f,form_f=sys.argv[1:4]; rows=[]
+for p in sorted(glob.glob(os.path.join(root,"*","fl","*","ranking.json"))):
+    bug=p.split(os.sep)[-4]; x=json.load(open(p)); tool=x.get("tool",p.split(os.sep)[-2])
+    if tool_f and tool!=tool_f: continue
+    for name,o in x["formulas"].items():
+        if form_f and form_f not in name: continue
+        fr=o.get("fault_rank"); rank=(f"{fr[0]}"+("" if fr[1]==fr[0] else f"-{fr[1]}")) if fr else "NOT FOUND"
+        rows.append((bug,tool,name,f"{len(x['failing'])}/{len(x['passing'])}",str(x.get("n_lines")),rank,
+                     f"{o['exam']:.4f}" if o.get("exam") is not None else "-"))
+def table(hdr,rows,left):
+    w=[max(len(r[i]) for r in rows+[hdr]) for i in range(len(hdr))]
+    print("  ".join(h.ljust(w[i]) for i,h in enumerate(hdr))); print("-"*(sum(w)+2*(len(hdr)-1)))
+    for r in rows: print("  ".join(c.ljust(w[i]) if i<left else c.rjust(w[i]) for i,c in enumerate(r)))
+if rows:
+    print("== fault localization =="); table(("bug","tool","formula","tests(f/p)","lines","fault-rank","EXAM"),rows,3)
+elif not (tool_f or form_f): print("(no FL rankings — cvebench coverage; cvebench fl)")
+arows=[]
+for p in sorted(glob.glob(os.path.join(root,"*","apr","*","*","validation.json"))):
+    v=json.load(open(p))
+    if tool_f and v["tool"]!=tool_f: continue
+    arows.append((v["bug"],v["tool"],v["candidate"],"yes" if v["compiles"] else "NO",
+                  f"{v['trigger_pass']}/{v['trigger_total']}",str(len(v["relevant_fail"])),v["suite"],
+                  "PLAUSIBLE" if v["plausible"] else "-"))
+if arows:
+    print(); print("== program repair =="); table(("bug","tool","candidate","compiles","trigger-pass","relevant-fail","suite","verdict"),arows,3)
+PY
+}
+
+[[ $# -ge 1 ]] || die "usage: cvebench {pids|bids|info|export|checkout|compile|test|coverage|fl|sbfl|diff|validate|apr|prepare|tools|summary|clean} ..."
 sub="$1"; shift || true; args "$@"
 case "$sub" in
   pids) cmd_pids;; bids) cmd_bids;; info) cmd_info;; export) cmd_export;;
   checkout) cmd_checkout;; compile) cmd_compile;; test) cmd_test;;
-  coverage) cmd_coverage;; sbfl) cmd_sbfl;; summary) cmd_summary;; clean) cluster_down;;
+  coverage) cmd_coverage;; fl) cmd_fl;; sbfl) cmd_sbfl;; prepare) cmd_prepare;;
+  diff) cmd_diff;; validate) cmd_validate;; apr) cmd_apr;;
+  tools) cmd_tools;; summary) cmd_summary;; clean) cluster_down;;
   *) die "unknown subcommand: $sub";;
 esac
