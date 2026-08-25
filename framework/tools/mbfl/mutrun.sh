@@ -6,6 +6,10 @@
 # test, where <sig> is a short hash of the failure signature (which expectation /
 # assertion vtest reported) so that "fails differently" is observable, or "-".
 set -u
+# HAProxy sizes its fd table from RLIMIT_NOFILE; container runtimes may hand out
+# a ~2^31 limit (kind/containerd), which makes haproxy allocate >60 GB and get
+# OOM-killed. Cap the soft limit for everything vtest spawns.
+ulimit -n 65536 2>/dev/null || ulimit -n 4096 2>/dev/null || true
 SRC="$1"; T="${2:-30}"
 cd "$SRC" || exit 2
 while IFS= read -r vtc; do

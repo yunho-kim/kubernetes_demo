@@ -4,6 +4,10 @@
 # /relevant.txt (test ids = trigger + relevant tests). Prints outcomes.txt lines
 # ("<id> <pass|fail|skip> <vtc>") on stdout.
 set -u
+# HAProxy sizes its fd table from RLIMIT_NOFILE; container runtimes may hand out
+# a ~2^31 limit (kind/containerd), which makes haproxy allocate >60 GB and get
+# OOM-killed. Cap the soft limit for everything vtest spawns.
+ulimit -n 65536 2>/dev/null || ulimit -n 4096 2>/dev/null || true
 SRC="$1"; MODE="${2:-relevant}"
 cd "$SRC" || exit 2
 cp /trigger.vtc reg-tests/_sbfl_trigger.vtc
