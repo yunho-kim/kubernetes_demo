@@ -3,56 +3,39 @@
 
 Defects4J-style: given per-test line coverage (gcovr JSON) labelled pass/fail,
 build the spectrum (ef/ep/nf/np per source line), compute suspiciousness with
-Ochiai / Tarantula / Jaccard / DStar, rank lines, and score the ranking against
-the ground-truth patched lines (the lines the real upstream fix touched).
+a family of SBFL formulas, rank lines, and score the ranking against the
+ground-truth patched lines (the lines the real upstream fix touched).
 
-Layout consumed (produced by `sbfl coverage`):
-  <results>/tests.json          [{"name","outcome":"pass|fail","coverage":"coverage/<f>.json"}]
-  <results>/coverage/*.json      gcovr JSON, one per test
-  <results>/ground_truth.json    {"lines":[{"file","line"}], "files":[...], "functions":[...]}
+Layout consumed (produced by `cvebench coverage`):
+  <results>/tests.json          [{"name","outcome":"pass|fail","coverage":"buggy/coverage/<f>.json"}]
+  <results>/buggy/coverage/*.json   compact per-test coverage
+  <results>/ground_truth.json    {"lines":[{"file","line"}], "files":[...]}
 
 Usage:
-  sbfl-rank -r <results-dir> [--formula ochiai] [--top 25]
+  sbfl-rank -r <results-dir> [--formula ochiai|...|all] [--top 25] [-o <out-dir>]
+
+Formulas (ef = failing tests covering the line, ep = passing tests covering it,
+nf/np = the rest; F = ef+nf, P = ep+np):
+  ochiai      ef / sqrt(F * (ef+ep))                       Abreu et al., TAIC PART 2007
+  tarantula   (ef/F) / (ef/F + ep/P)                       Jones & Harrold, ASE 2005
+  jaccard     ef / (F + ep)                                Chen et al., DSN 2002
+  dstar       ef^2 / (ep + nf)         (D*, *=2)           Wong et al., TR 2014
+  op2         ef - ep / (P + 1)        (Naish2)            Naish et al., TOSEM 2011
+  barinel     1 - ep / (ep + ef)       (single-fault form) Abreu et al., ASE 2009
+  gp13        ef * (1 + 1 / (2*ep + ef))                   Yoo, SSBSE 2012
+  kulczynski2 (ef/F + ef/(ef+ep)) / 2                      Naish et al., TOSEM 2011
+  ample       | ef/F - ep/P |                              Dallmeier et al., ECOOP 2005
 """
-import argparse, json, math, os, sys
-from collections import defaultdict
+import argparse
+import math
+import os
+import sys
 
-FORMULAS = ("ochiai", "tarantula", "jaccard", "dstar")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import flcommon as fl  # noqa: E402
 
-
-def load_coverage(path):
-    """Return {(file, line)} covered by this test.
-
-    Supports our compact format ({"covered": {file: [lines]}}) and falls back
-    to raw gcovr JSON ({"files": [{"file","lines":[{"line_number","count"}]}]}).
-    """
-    with open(path) as fh:
-        data = json.load(fh)
-    covered = set()
-    if "covered" in data:                       # compact (produced by covrun.sh)
-        for fname, lines in data["covered"].items():
-            for ln in lines:
-                covered.add((norm(fname), int(ln)))
-        return covered
-    for f in data.get("files", []):             # raw gcovr fallback
-        fname = norm(f.get("file", ""))
-        for ln in f.get("lines", []):
-            if ln.get("count", 0) and ln.get("line_number"):
-                covered.add((fname, int(ln["line_number"])))
-    return covered
-
-
-def norm(p):
-    # normalise to a src-relative path so paths compare equal across tools
-    p = p.replace("\\", "/")
-    for marker in ("/build/", "./"):
-        if p.startswith(marker):
-            p = p[len(marker):]
-    # strip leading haproxy-x.y.z/
-    parts = p.split("/")
-    if parts and parts[0].startswith("haproxy-"):
-        parts = parts[1:]
-    return "/".join(parts)
+FORMULAS = ("ochiai", "tarantula", "jaccard", "dstar", "op2", "barinel",
+            "gp13", "kulczynski2", "ample")
 
 
 def suspiciousness(formula, ef, ep, nf, np_):
@@ -70,80 +53,31 @@ def suspiciousness(formula, ef, ep, nf, np_):
         return ef / d if d else 0.0
     if formula == "dstar":          # D* with * = 2
         d = ep + nf
-        return (ef * ef) / d if d else float("inf") if ef else 0.0
+        return (ef * ef) / d if d else (float("inf") if ef else 0.0)
+    if formula == "op2":
+        return ef - ep / (P + 1)
+    if formula == "barinel":
+        d = ep + ef
+        return 1.0 - ep / d if d else 0.0
+    if formula == "gp13":
+        d = 2 * ep + ef
+        return ef * (1.0 + 1.0 / d) if d else 0.0
+    if formula == "kulczynski2":
+        a = ef / F if F else 0.0
+        b = ef / (ef + ep) if (ef + ep) else 0.0
+        return (a + b) / 2.0
+    if formula == "ample":
+        a = ef / F if F else 0.0
+        b = ep / P if P else 0.0
+        return abs(a - b)
     raise ValueError(formula)
-
-
-def build_spectrum(results_dir):
-    with open(os.path.join(results_dir, "tests.json")) as fh:
-        tests = json.load(fh)
-    fail = [t for t in tests if t["outcome"] == "fail"]
-    pas = [t for t in tests if t["outcome"] == "pass"]
-    if not fail:
-        sys.exit("error: need at least one failing test")
-    if not pas:
-        sys.exit("error: need at least one passing test")
-
-    ef = defaultdict(int); ep = defaultdict(int)
-    for grp, counter in ((fail, ef), (pas, ep)):
-        for t in grp:
-            cov = load_coverage(os.path.join(results_dir, t["coverage"]))
-            for elem in cov:
-                counter[elem] += 1
-    elems = set(ef) | set(ep)
-    F, P = len(fail), len(pas)
-    spectrum = {}
-    for e in elems:
-        e_ef, e_ep = ef[e], ep[e]
-        spectrum[e] = (e_ef, e_ep, F - e_ef, P - e_ep)   # ef, ep, nf, np
-    return spectrum, F, P, [t["name"] for t in fail], [t["name"] for t in pas]
-
-
-def load_ground_truth(results_dir):
-    p = os.path.join(results_dir, "ground_truth.json")
-    if not os.path.exists(p):
-        return None
-    with open(p) as fh:
-        gt = json.load(fh)
-    lines = {(norm(l["file"]), int(l["line"])) for l in gt.get("lines", [])}
-    files = {norm(f) for f in gt.get("files", [])}
-    return {"lines": lines, "files": files, "raw": gt}
 
 
 def rank(spectrum, formula):
     scored = [(e, suspiciousness(formula, *spectrum[e])) for e in spectrum]
-    # sort by suspiciousness desc; deterministic tie-break by (file, line)
+    # suspiciousness desc; deterministic tie-break by (file, line)
     scored.sort(key=lambda x: (-x[1], x[0][0], x[0][1]))
     return scored
-
-
-def score_against_gt(scored, gt):
-    """Return (best_rank, worst_rank, total, exam) for first ground-truth hit.
-    best_rank uses optimistic tie handling, worst_rank pessimistic."""
-    if not gt or not gt["lines"]:
-        return None
-    total = len(scored)
-    gt_lines = gt["lines"]
-    # group by suspiciousness to handle ties
-    best = worst = None
-    seen = 0
-    i = 0
-    while i < len(scored):
-        j = i
-        while j < len(scored) and scored[j][1] == scored[i][1]:
-            j += 1
-        tie = scored[i:j]                      # same suspiciousness
-        hit = any(e in gt_lines for e, _ in tie)
-        if hit:
-            best = seen + 1                    # optimistic: top of the tie block
-            worst = seen + len(tie)            # pessimistic: bottom of the tie block
-            break
-        seen += len(tie)
-        i = j
-    if best is None:
-        return None
-    exam = (best - 1) / total if total else 0.0
-    return best, worst, total, exam
 
 
 def main():
@@ -151,52 +85,39 @@ def main():
     ap.add_argument("-r", "--results", required=True)
     ap.add_argument("--formula", choices=FORMULAS + ("all",), default="all")
     ap.add_argument("--top", type=int, default=25)
-    ap.add_argument("--json-out", default=None)
+    ap.add_argument("-o", "--out-dir", default=None,
+                    help="write <out-dir>/ranking.json (default: <results>/fl/sbfl)")
+    ap.add_argument("--json-out", default=None, help=argparse.SUPPRESS)  # legacy
     args = ap.parse_args()
 
-    spectrum, F, P, fnames, pnames = build_spectrum(args.results)
-    gt = load_ground_truth(args.results)
+    spectrum, fnames, pnames = fl.build_spectrum(args.results)
+    gt = fl.load_ground_truth(args.results)
 
     print(f"# SBFL  results={args.results}")
-    print(f"#   failing tests ({F}): {', '.join(fnames)}")
-    print(f"#   passing tests ({P}): {', '.join(pnames)}")
+    print(f"#   failing tests ({len(fnames)}): {', '.join(fnames)}")
+    print(f"#   passing tests ({len(pnames)}): {', '.join(pnames)}")
     print(f"#   instrumented lines in spectrum: {len(spectrum)}")
     if gt:
         print(f"#   ground-truth lines: {sorted(gt['lines'])}")
     print()
 
+    def detail(e):
+        ef, ep, nf, np_ = spectrum[e]
+        return f"(ef={ef} ep={ep} nf={nf} np={np_})"
+
     formulas = FORMULAS if args.formula == "all" else (args.formula,)
-    out = {"failing": fnames, "passing": pnames, "n_lines": len(spectrum), "formulas": {}}
-
+    out = {}
     for formula in formulas:
-        scored = rank(spectrum, formula)
-        sc = score_against_gt(scored, gt)
-        print(f"=== {formula.upper()} ===")
-        if sc:
-            best, worst, total, exam = sc
-            print(f"  fault rank: {best}"
-                  + (f"–{worst} (tie)" if worst != best else "")
-                  + f"  of {total}   EXAM={exam:.4f}")
-        elif gt:
-            print("  fault rank: NOT FOUND in spectrum "
-                  "(ground-truth lines never executed by any test)")
-        topn = scored[: args.top]
-        for k, (e, s) in enumerate(topn, 1):
-            mark = "  <== FAULT" if gt and e in gt["lines"] else ""
-            ef, ep, nf, np_ = spectrum[e]
-            print(f"  {k:>3}. {s:7.4f}  {e[0]}:{e[1]}  (ef={ef} ep={ep} nf={nf} np={np_}){mark}")
-        print()
-        out["formulas"][formula] = {
-            "fault_rank": sc[:3] if sc else None,
-            "exam": sc[3] if sc else None,
-            "top": [{"file": e[0], "line": e[1], "susp": s,
-                     "spectrum": spectrum[e]} for e, s in topn],
-        }
+        entry = fl.report(formula, rank(spectrum, formula), gt, args.top, detail)
+        for row in entry["top"]:
+            row["spectrum"] = list(spectrum[(row["file"], row["line"])])
+        out[formula] = entry
 
-    if args.json_out:
-        with open(args.json_out, "w") as fh:
-            json.dump(out, fh, indent=2)
-        print(f"wrote {args.json_out}")
+    out_dir = args.out_dir or os.path.join(args.results, "fl", "sbfl")
+    path = fl.write_ranking(out_dir, "sbfl", fnames, pnames, len(spectrum), out)
+    if args.json_out and os.path.abspath(args.json_out) != os.path.abspath(path):
+        import shutil
+        shutil.copy(path, args.json_out)
 
 
 if __name__ == "__main__":

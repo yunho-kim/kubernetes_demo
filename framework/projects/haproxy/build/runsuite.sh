@@ -5,6 +5,10 @@
 # <out_dir>/coverage/<id>.json (compact per-test line coverage). vtest starts and
 # cleanly stops HAProxy, which flushes .gcda — no gdb needed for reg-tests.
 set -u
+# HAProxy sizes its fd table from RLIMIT_NOFILE; container runtimes may hand out
+# a ~2^31 limit (kind/containerd), which makes haproxy allocate >60 GB and get
+# OOM-killed. Cap the soft limit for everything vtest spawns.
+ulimit -n 65536 2>/dev/null || ulimit -n 4096 2>/dev/null || true
 SRC="$1"; LIST="$2"; OUT="$3"; MODE="${4:-cov}"
 cd "$SRC" || exit 2
 mkdir -p "$OUT/coverage"

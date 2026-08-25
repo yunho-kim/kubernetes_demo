@@ -1,0 +1,8 @@
+{
+  "name": "llmao",
+  "kind": "fl",
+  "description": "LLMAO: test-free LLM fault localization (CodeGen backbone + trained bidirectional adapter, Devign/C checkpoint) over files executed by the failing tests",
+  "reference": "A. Z. H. Yang, C. Le Goues, R. Martins, V. J. Hellendoorn. Large Language Models for Test-Free Fault Localization. ICSE 2024.",
+  "url": "https://github.com/squaresLab/LLMAO",
+  "granularity": "line"
+}
