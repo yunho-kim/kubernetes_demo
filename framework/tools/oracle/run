@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""run — reference APR adapter (the "oracle" repair tool).
+
+    run <results-dir> <workdir> -o <out-dir>
+
+APR adapter contract (see docs/INTEGRATION.md):
+  <results-dir>  results/<pid>-<bid>/ — may hold FL output (fl/<tool>/ranking.json)
+                 and the test classification; an APR tool may read it, but must
+                 not require it.
+  <workdir>      a buggy checkout made by `cvebench checkout -v buggy -w <workdir>`:
+                 <workdir>/haproxy-<ver>/   the source tree to repair
+                 <workdir>/cvebench.bug     "<pid> <bid> buggy"
+                 <workdir>/cvebench-tests/  the bug's trigger.vtc + regtests.txt
+  <out-dir>      the tool writes candidate patches here as
+                 <out-dir>/candidates/<name>.patch  (unified diff, `patch -p1`
+                 relative to the source tree root, i.e. a/src/h1.c b/src/h1.c)
+                 and may write anything else it likes (logs, tool.json …).
+  The harness (`cvebench apr` / `cvebench validate`) then builds and tests
+  every candidate and writes <out-dir>/<candidate>/validation.json.
+
+This reference tool "repairs" the bug by emitting the real upstream fix
+(patches/<bid>.fix.patch — the patch that `checkout -v buggy` reverse-applied),
+which must validate as plausible, plus an empty patch, which must not. It
+exists to test the pipeline and to serve as a template; a real tool would
+read the FL ranking, mutate <workdir>, and export its edits with
+`cvebench diff -w <workdir>`.
+"""
+import argparse
+import os
+import shutil
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("results")
+    ap.add_argument("workdir")
+    ap.add_argument("-o", "--out-dir", required=True)
+    args = ap.parse_args()
+
+    with open(os.path.join(args.workdir, "cvebench.bug")) as fh:
+        pid, bid, variant = fh.read().split()
+    if variant != "buggy":
+        raise SystemExit(f"workdir is a {variant} checkout; APR needs -v buggy")
+
+    cand = os.path.join(args.out_dir, "candidates")
+    os.makedirs(cand, exist_ok=True)
+    fix = os.path.join(FW_ROOT, "projects", pid, "patches", f"{bid}.fix.patch")
+    shutil.copy(fix, os.path.join(cand, "oracle.patch"))
+    open(os.path.join(cand, "empty.patch"), "w").close()
+    print(f"oracle: wrote {cand}/oracle.patch (upstream fix for {pid}-{bid}) and empty.patch")
+
+
+if __name__ == "__main__":
+    main()

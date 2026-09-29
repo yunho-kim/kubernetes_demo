@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""run — cvebench adapter for FLITSR (Callaghan & Fischer, ISSTA 2023).
+
+    run <results-dir> [-o <out-dir>] [--metric M ...] [--type flitsr|multi|sbfl ...] [--top N]
+
+FLITSR reads the GZoltar CLI layout (spectra.csv / tests.csv / matrix.txt with
+`pkg$Class#method:line` element names). cvebench emits the older GZoltar
+layout (spectra / tests / matrix, elements `file#line`), so this adapter
+
+  1. rewrites results/<bug>/gzoltar/ into <out-dir>/gzoltar-cli/ with element
+     names `<dir with / -> .>$<basename>#-:<line>` (C has no classes; the
+     method slot is '-'),
+  2. runs flitsr once per (type, metric): --sbfl = plain metric inside the
+     FLITSR framework, --flitsr = the FLITSR algorithm, --multi = FLITSR*,
+  3. maps the CSV ranking back to (file, line), scores it against the cvebench
+     ground truth and writes <out-dir>/ranking.json (see flcommon.py).
+
+Only the standard library is used here; flitsr itself runs from the venv that
+prepare.sh creates (framework/tools/flitsr/.venv).
+"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "lib"))
+import flcommon as fl  # noqa: E402
+
+FLITSR = os.path.join(HERE, ".venv", "bin", "flitsr")
+DEFAULT_METRICS = ("ochiai", "dstar", "tarantula", "gp13", "barinel")
+DEFAULT_TYPES = ("flitsr", "multi")
+TYPE_LABEL = {"sbfl": "sbfl", "flitsr": "flitsr", "multi": "flitsr_star"}
+
+
+def dotted(path):
+    """src/h1.c -> ('src', 'h1.c'); h1.c -> ('root', 'h1.c')."""
+    d, b = os.path.split(path)
+    return (d.replace("/", ".") or "root"), b
+
+
+def convert(results_dir, cli_dir):
+    """Write the GZoltar-CLI layout FLITSR expects; return {dotted_name: file}."""
+    os.makedirs(cli_dir, exist_ok=True)
+    gz = os.path.join(results_dir, "gzoltar")
+    back, n = {}, 0
+    with open(os.path.join(cli_dir, "spectra.csv"), "w") as out:
+        out.write("name\n")
+        for f, ln in fl.load_gzoltar_elements(results_dir):
+            pkg, base = dotted(f)
+            back[f"{pkg}.{base}"] = f
+            out.write(f"{pkg}${base}#-:{ln}\n")
+            n += 1
+    shutil.copy(os.path.join(gz, "tests"), os.path.join(cli_dir, "tests.csv"))
+    shutil.copy(os.path.join(gz, "matrix"), os.path.join(cli_dir, "matrix.txt"))
+    return back, n
+
+
+def parse_csv(path, back):
+    """FLITSR --csv output (`name;susp`, rank order) -> [((file, line), susp)]."""
+    scored = []
+    with open(path) as fh:
+        header = fh.readline()
+        if not header.startswith("name;"):
+            raise SystemExit(f"unexpected flitsr output header: {header!r}")
+        for line in fh:
+            line = line.rstrip()
+            if not line:
+                continue
+            name, susp = line.rsplit(";", 1)
+            cls, rest = name.split("#", 1)          # 'src.h1$c' , '-:582'
+            pkg, base = cls.split("$", 1)
+            ln = int(rest.rsplit(":", 1)[1])
+            f = back.get(f"{pkg}.{base}")
+            if f is None:
+                raise SystemExit(f"cannot map flitsr element back to a file: {name}")
+            # FLITSR*/FLITSR emit exact integers around 2**64 for promoted
+            # groups; keep them as int so distinct scores don't collapse into
+            # one tie block when converted to float.
+            scored.append(((f, ln), int(susp) if susp.lstrip("-").isdigit() else float(susp)))
+    return scored
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("results")
+    ap.add_argument("-o", "--out-dir", default=None)
+    ap.add_argument("--metric", action="append", default=None,
+                    help="base SBFL metric (repeatable); default: %s" % ",".join(DEFAULT_METRICS))
+    ap.add_argument("--type", action="append", default=None, choices=sorted(TYPE_LABEL),
+                    help="ranking technique (repeatable); default: %s" % ",".join(DEFAULT_TYPES))
+    ap.add_argument("--top", type=int, default=15)
+    args = ap.parse_args()
+
+    if not os.access(FLITSR, os.X_OK):
+        raise SystemExit(f"flitsr not installed at {FLITSR} — run {HERE}/prepare.sh "
+                         f"(or: cvebench prepare -t flitsr)")
+    out_dir = args.out_dir or os.path.join(args.results, "fl", "flitsr")
+    os.makedirs(out_dir, exist_ok=True)
+    cli_dir = os.path.join(out_dir, "gzoltar-cli")
+    back, n_lines = convert(args.results, cli_dir)
+    fail, pas = fl.load_tests(args.results)
+    fnames, pnames = [t["name"] for t in fail], [t["name"] for t in pas]
+    gt = fl.load_ground_truth(args.results)
+
+    print(f"# FLITSR  results={args.results}")
+    print(f"#   failing tests ({len(fnames)}): {', '.join(fnames)}")
+    print(f"#   passing tests ({len(pnames)}): {', '.join(pnames)}")
+    print(f"#   elements: {n_lines}")
+    if gt:
+        print(f"#   ground-truth lines: {sorted(gt['lines'])}")
+    print()
+
+    formulas = {}
+    for typ in args.type or DEFAULT_TYPES:
+        for metric in args.metric or DEFAULT_METRICS:
+            name = f"{TYPE_LABEL[typ]}_{metric}"
+            csv = os.path.join(out_dir, f"{name}.csv")
+            cmd = [FLITSR, cli_dir, f"--{typ}", "-m", metric, "--csv", "-o", csv]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0 or not os.path.exists(csv):
+                sys.stderr.write(r.stdout + r.stderr)
+                raise SystemExit(f"flitsr failed: {' '.join(cmd)}")
+            formulas[name] = fl.report(name, parse_csv(csv, back), gt, args.top)
+
+    fl.write_ranking(out_dir, "flitsr", fnames, pnames, n_lines, formulas)
+
+
+if __name__ == "__main__":
+    main()

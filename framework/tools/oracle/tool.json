@@ -1,0 +1,8 @@
+{
+  "name": "oracle",
+  "kind": "apr",
+  "description": "Reference APR adapter: emits the upstream fix (oracle patch) and an empty patch to exercise the validation pipeline",
+  "reference": "cvebench built-in example; use it as a template for real APR tools",
+  "url": "",
+  "granularity": "patch"
+}

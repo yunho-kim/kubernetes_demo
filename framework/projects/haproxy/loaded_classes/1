@@ -66,7 +66,6 @@ include/import/slz-tables.h
 include/import/xxhash.h
 src/acl.c
 src/action.c
-src/activity.c
 src/applet.c
 src/arg.c
 src/auth.c
@@ -91,7 +90,6 @@ src/ebistree.c
 src/ebmbtree.c
 src/ebsttree.c
 src/ebtree.c
-src/ev_epoll.c
 src/ev_poll.c
 src/ev_select.c
 src/fcgi-app.c

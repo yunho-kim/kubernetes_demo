@@ -1,0 +1,9 @@
+# LLMAO runtime. torch wheels on Linux bundle CUDA; CPU-only machines work too (slowly).
+# transformers is pinned to a 4.x release: LLMAO ships its own modeling_codegen.py that
+# imports transformers internals removed in 5.x.
+torch>=2.4
+transformers==4.46.3
+accelerate>=0.30
+numpy
+pandas
+sentencepiece

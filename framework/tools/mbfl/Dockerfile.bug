@@ -1,0 +1,33 @@
+# Per-bug Mull-instrumented build of the BUGGY program. Build context is
+# assembled by `run` (source tarball, fix patch, mull.yml, trigger.vtc, mutrun.sh).
+ARG BASE_IMAGE=cvebench-mull:llvm19-0.34.0
+FROM $BASE_IMAGE
+ARG LLVM=19
+ARG HAPROXY_VERSION
+ARG EXTRA_MAKE=
+COPY haproxy-src.tar.gz /tmp/haproxy-src.tar.gz
+RUN tar xzf /tmp/haproxy-src.tar.gz -C /build && rm -f /tmp/haproxy-src.tar.gz
+WORKDIR /build/haproxy-${HAPROXY_VERSION}
+COPY fix.patch /tmp/fix.patch
+RUN echo "== reverse-applying fix to create BUGGY ==" && patch -R -p1 --no-backup-if-mismatch < /tmp/fix.patch
+COPY mull.yml /build/mull.yml
+ENV MULL_CONFIG=/build/mull.yml
+# Same configuration as the coverage build (Dockerfile.minpair), but clang + the Mull plugin.
+RUN make -j"$(nproc)" CC=clang-${LLVM} TARGET=linux-glibc \
+        USE_OPENSSL= USE_PCRE= USE_PCRE2= USE_ZLIB= USE_LUA= USE_SYSTEMD= \
+        CPU_CFLAGS="-O0" \
+        DEBUG_CFLAGS="-g3 -fno-inline -fpass-plugin=/usr/lib/mull-ir-frontend-${LLVM}" \
+        $EXTRA_MAKE \
+    && cp haproxy /usr/local/bin/haproxy && ./haproxy -v | head -1
+# Every mutant baked into the binary: "mutator:file:line:col:endline:endcol:replacement", NUL-separated.
+RUN objcopy -O binary --only-section=.mull_mutants /usr/local/bin/haproxy /build/mutants.bin \
+    && tr '\0' '\n' < /build/mutants.bin | grep -v '^$' > /build/mutants.txt \
+    && echo "mutants: $(wc -l < /build/mutants.txt)"
+COPY trigger.vtc reg-tests/_sbfl_trigger.vtc
+COPY mutrun.sh /mutrun.sh
+# haproxy -> wrapper that turns MULL_MUTANT into the mutant's environment switch (see haproxy-wrapper.sh)
+COPY haproxy-wrapper.sh /tmp/haproxy-wrapper.sh
+RUN mv /usr/local/bin/haproxy /usr/local/bin/haproxy.real \
+    && install -m 0755 /tmp/haproxy-wrapper.sh /usr/local/bin/haproxy
+ENV HAPROXY_SRC=/build/haproxy-${HAPROXY_VERSION}
+CMD ["sleep", "infinity"]

@@ -90,4 +90,4 @@ open(f"{P}/loaded_classes/{b}","w").write("\n".join(c["loaded"])+"\n")
 PY
 
 echo; log "=============== SBFL ranking ($PID-$BID) ==============="
-python3 "$HERE/sbfl-rank" -r "$R" --top 15 --json-out "$R/ranking.json"
+python3 "$HERE/sbfl-rank" -r "$R" --top 15 -o "$R/fl/sbfl"

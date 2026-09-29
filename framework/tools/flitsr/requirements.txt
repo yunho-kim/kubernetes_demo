@@ -1,0 +1,2 @@
+# FLITSR — https://pypi.org/project/flitsr/  (pulls numpy, scipy, bitarray, deprecated)
+flitsr==2.4.0

@@ -1,0 +1,26 @@
+# Base layer for Mull-instrumented HAProxy builds: Debian 13 + clang + Mull + vtest.
+# Built once by prepare.sh as $BASE_IMAGE; per-bug images derive from it (Dockerfile.bug).
+FROM debian:trixie
+ARG LLVM=19
+ARG MULL_VERSION=0.34.0
+ARG MULL_LLVM_FULL=19.1.7
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang-$LLVM gcc make libc6-dev binutils wget ca-certificates git patch bash python3 zlib1g-dev libpcre2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Mull (https://github.com/mull-project/mull): the IR plugin bakes every mutant
+# into the binary; a mutant is enabled at run time when an environment variable
+# named after it (mutator:file:line:col:endline:endcol) is set.
+RUN set -e; arch="$(dpkg --print-architecture)"; \
+    case "$arch" in amd64) a=amd64;; arm64) a=aarch64;; *) echo "unsupported arch $arch"; exit 1;; esac; \
+    deb="Mull-${LLVM}-${MULL_VERSION}-LLVM-${MULL_LLVM_FULL}-debian-${a}-13.deb"; \
+    wget -q -O /tmp/mull.deb "https://github.com/mull-project/mull/releases/download/${MULL_VERSION}/${deb}"; \
+    apt-get update && apt-get install -y --no-install-recommends /tmp/mull.deb && rm -rf /var/lib/apt/lists/* /tmp/mull.deb; \
+    test -f /usr/lib/mull-ir-frontend-${LLVM}
+
+# vtest — the harness that runs HAProxy's reg-tests/*.vtc
+RUN git clone --depth 1 https://github.com/vtest/VTest.git /opt/VTest \
+    && make -C /opt/VTest -j"$(nproc)" \
+    && cp /opt/VTest/vtest /usr/local/bin/vtest
+WORKDIR /build

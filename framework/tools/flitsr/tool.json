@@ -1,0 +1,8 @@
+{
+  "name": "flitsr",
+  "kind": "fl",
+  "description": "FLITSR / FLITSR* multi-fault spectrum-based fault localization over the GZoltar spectrum",
+  "reference": "D. Callaghan, B. Fischer. Improving Spectrum-Based Localization of Multiple Faults by Iterative Test Suite Reduction. ISSTA 2023.",
+  "url": "https://github.com/DCallaz/flitsr",
+  "granularity": "line"
+}
