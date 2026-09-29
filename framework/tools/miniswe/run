@@ -27,116 +27,16 @@ Pipeline, per run k = 1..R
 The harness (cvebench apr) then validates every candidate in a clean image.
 """
 import argparse
-import io
 import json
 import os
-import re
-import shutil
-import subprocess
 import sys
-import tarfile
-import tempfile
 import time
-import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 VENV_PY = os.path.join(HERE, ".venv", "bin", "python")
-CVEBENCH = os.path.join(FW_ROOT, "bin", "cvebench")
-
-# benchmark build flags (framework/projects/haproxy/build/Dockerfile.minpair) — the
-# sandbox rebuilds incrementally on top of the image's objects, so they must match
-BUILD_SH = r"""#!/usr/bin/env bash
-# cvebench-build — rebuild HAProxy after source edits and install it for vtest.
-cd "$HAPROXY_SRC" || exit 2
-log=/tmp/cvebench-build.log
-if make -j"$(nproc)" TARGET=linux-glibc \
-     USE_OPENSSL= USE_PCRE= USE_PCRE2= USE_ZLIB= USE_LUA= USE_SYSTEMD= \
-     CPU_CFLAGS="-O0" DEBUG_CFLAGS="-g3 -fno-inline -fprofile-arcs -ftest-coverage" \
-     LDFLAGS="-fprofile-arcs -ftest-coverage" __EXTRA_MAKE__ >"$log" 2>&1; then
-  cp haproxy /usr/local/bin/haproxy.real && echo "build OK"
-else
-  echo "BUILD FAILED:"; grep -E 'error|Error|undefined reference' "$log" | head -40
-  exit 1
-fi
-"""
-
-TEST_SH = r"""#!/usr/bin/env bash
-# cvebench-test [trigger|all|<vtc> ...] — rebuild, then run reg-tests with vtest.
-ulimit -n 65536 2>/dev/null || ulimit -n 4096 2>/dev/null || true
-cvebench-build >/tmp/cvebench-build.out || { cat /tmp/cvebench-build.out; exit 1; }
-cd "$HAPROXY_SRC" || exit 2
-[ $# -eq 0 ] && set -- trigger
-list=()
-for a in "$@"; do
-  case "$a" in
-    trigger) list+=(/cvebench/trigger.vtc) ;;
-    all) list+=(/cvebench/trigger.vtc)
-         while IFS= read -r v; do list+=("$v"); done < /tmp/relevant_vtc.txt ;;
-    *) list+=("$a") ;;
-  esac
-done
-fail=0
-for vtc in "${list[@]}"; do
-  HAPROXY_PROGRAM=/usr/local/bin/haproxy timeout -s KILL 60 vtest "$vtc" >/tmp/v.log 2>&1
-  case "$?" in
-    0) echo "PASS $vtc" ;;
-    77) echo "SKIP $vtc" ;;
-    *) fail=$((fail+1)); echo "FAIL $vtc"
-       grep -E '^---- |^\*\*\*  [a-z0-9]+ +debug\|.*(error|alert|Fatal|ALERT)' /tmp/v.log | tail -8 | sed 's/^/    /' ;;
-  esac
-done
-echo "== ${#list[@]} test(s), $fail failed"
-[ $fail -eq 0 ]
-"""
-
-
-def sh(cmd, **kw):
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
-
-
-def default_model(base_url):
-    try:
-        with urllib.request.urlopen(base_url.rstrip("/") + "/models", timeout=10) as r:
-            return "openai/" + json.load(r)["data"][0]["id"]
-    except Exception as e:
-        raise SystemExit(f"no --model / MSWEA_MODEL and cannot list models at {base_url}: {e}")
-
-
-def fl_hints(results, spec, top):
-    tool, _, formula = spec.partition(":")
-    p = os.path.join(results, "fl", tool, "ranking.json")
-    if not os.path.exists(p):
-        raise SystemExit(f"--fl {spec}: {p} not found (cvebench fl -t {tool})")
-    fs = json.load(open(p))["formulas"]
-    name = formula or next(iter(fs))
-    if name not in fs:
-        raise SystemExit(f"--fl {spec}: no formula {name} in {p} (have: {', '.join(fs)})")
-    rows = fs[name]["top"][:top]
-    return name, "\n".join(f"  {i + 1}. {r['file']}:{r['line']}" for i, r in enumerate(rows))
-
-
-def export_patch(env, src, workdir, out_patch):
-    """Copy the sandbox's changed/new src|include *.c/*.h onto a copy of workdir -> cvebench diff."""
-    cid = env.container_id
-    r = subprocess.run(["docker", "exec", cid, "bash", "-c",
-                        f"cd {src} && find src include \\( -name '*.c' -o -name '*.h' \\) -newer /tmp/.cvebench-start -print0 "
-                        "| tar --null -T - -cf -"], capture_output=True)
-    names = []
-    with tempfile.TemporaryDirectory() as tmp:
-        wd = os.path.join(tmp, "wd")
-        shutil.copytree(workdir, wd, symlinks=True)
-        tree = os.path.join(wd, os.path.basename(src))
-        if r.stdout:
-            with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
-                members = [m for m in tf.getmembers() if m.isfile() and not m.name.startswith(("/", ".."))]
-                names = [m.name for m in members]
-                tf.extractall(tree, members=members, filter="data")
-        diff = sh([CVEBENCH, "diff", "-w", wd]).stdout if names else ""
-    if diff.strip():
-        with open(out_patch, "w") as fh:
-            fh.write(diff)
-    return names, diff
+sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
+import aprsandbox as sb  # noqa: E402
 
 
 def main():
@@ -178,21 +78,12 @@ def main():
     from minisweagent.models.litellm_model import LitellmModel
     from minisweagent.models.litellm_textbased_model import LitellmTextbasedModel
 
-    with open(os.path.join(args.workdir, "cvebench.bug")) as fh:
-        pid, bid, variant = fh.read().split()
-    if variant != "buggy":
-        raise SystemExit(f"workdir is a {variant} checkout; APR needs -v buggy")
-    pdir = os.path.join(FW_ROOT, "projects", pid)
-    version = next(l.split(",")[2] for l in open(os.path.join(pdir, "commit-db")) if l.startswith(f"{bid},"))
-    src = f"/build/haproxy-{version}"
-    img = f"cvebench:{pid}-{bid}-buggy"
-    if sh(["docker", "image", "inspect", img]).returncode != 0:
-        print(f"[miniswe] building {img} (sandbox image)", flush=True)
-        if subprocess.run([CVEBENCH, "compile", "-p", pid, "-b", bid]).returncode != 0:
-            raise SystemExit(f"cannot build {img}")
+    bug = sb.Bug(args.workdir)
+    pid, bid, src = bug.pid, bug.bid, bug.src
+    bug.ensure_image("miniswe")
 
     replay = [l.rstrip("\n") for l in open(args.replay) if l.strip() and not l.startswith("#")] if args.replay else None
-    model_name = "replay" if replay else args.model or (default_model(args.base_url) if args.base_url else None)
+    model_name = "replay" if replay else args.model or (sb.default_model(args.base_url) if args.base_url else None)
     if not model_name:
         raise SystemExit("no model: set MSWEA_MODEL (litellm name) or OPENAI_BASE_URL")
     cfg = yaml.safe_load(open(os.path.join(HERE, "config.yaml")))
@@ -201,38 +92,7 @@ def main():
 
     # ---- sandbox helpers (mounted read-only at /cvebench)
     sbx = os.path.join(out_dir, "sandbox")
-    os.makedirs(os.path.join(sbx, "bin"), exist_ok=True)
-    extra_make = ""
-    benv = os.path.join(pdir, "tests", bid, "build.env")
-    if os.path.exists(benv):
-        m = re.search(r'^EXTRA_MAKE="?([^"\n]*)"?', open(benv).read(), re.M)
-        extra_make = m.group(1) if m else ""
-    for name, body in (("cvebench-build", BUILD_SH.replace("__EXTRA_MAKE__", extra_make)), ("cvebench-test", TEST_SH)):
-        p = os.path.join(sbx, "bin", name)
-        with open(p, "w") as fh:
-            fh.write(body)
-        os.chmod(p, 0o755)
-    trig = open(os.path.join(args.workdir, "cvebench-tests", "trigger.vtc")).read()
-    if not args.keep_comments:  # the crafted triggers' comments explain buggy vs fixed behaviour (and name functions)
-        trig = "".join(l for l in trig.splitlines(keepends=True) if not l.lstrip().startswith("#"))
-    if not args.no_redact:
-        trig = re.sub(r"CVE-\d{4}-\d+", "CVE-XXXX-XXXXX", trig)
-    open(os.path.join(sbx, "trigger.vtc"), "w").write(trig)
-    # related regression tests = trigger + relevant ids, resolved to vtc paths in the sandbox
-    ids = set()
-    for f in ("trigger_tests", "relevant_tests"):
-        p = os.path.join(pdir, f, bid)
-        if os.path.exists(p):
-            ids |= {l.strip() for l in open(p) if l.strip()}
-    open(os.path.join(sbx, "relevant_ids.txt"), "w").write("\n".join(sorted(ids)) + "\n")
-    globs = [l.strip() for l in open(os.path.join(pdir, "tests", bid, "regtests.txt")) if l.strip() and not l.lstrip().startswith("#")]
-    open(os.path.join(sbx, "globs.txt"), "w").write("\n".join(globs) + "\n")
-
-    setup = (f"rm -f /tmp/fix.patch /tmp/candidate.patch {src}/CHANGELOG && "
-             f"cd {src} && ls $(cat /cvebench/globs.txt) 2>/dev/null | sort -u | while read -r v; do "
-             "id=$(printf '%s' \"$v\" | sed 's#reg-tests/##; s#[/.]#_#g'); "
-             "grep -qx \"$id\" /cvebench/relevant_ids.txt && echo \"$v\"; done > /tmp/relevant_vtc.txt; "
-             "touch /tmp/.cvebench-start")
+    trig = sb.write_helpers(bug, sbx, keep_comments=args.keep_comments, redact=not args.no_redact)
 
     summary_p = os.path.join(out_dir, "miniswe.json")
     summary = json.load(open(summary_p)) if os.path.exists(summary_p) else {}
@@ -260,24 +120,17 @@ def main():
         if os.path.exists(cand):
             os.remove(cand)
         env = DockerEnvironment(
-            image=img, cwd=src, timeout=cfg["environment"]["timeout"],
+            image=bug.image, cwd=src, timeout=cfg["environment"]["timeout"],
             interpreter=cfg["environment"]["interpreter"], env=cfg["environment"]["env"],
-            run_args=["--rm", "--network", "none", "--ulimit", "nofile=65536:65536", "--cap-add=SYS_PTRACE",
-                      "-v", f"{sbx}:/cvebench:ro"],
+            run_args=["--rm", *sb.DOCKER_ARGS, "-v", f"{sbx}:/cvebench:ro"],
             container_timeout=f"{args.time_limit + 900}s")
         t0 = time.time()
         try:
-            r = env.execute({"command": setup})
+            r = env.execute({"command": sb.setup_cmd(src)})
             if r["returncode"] != 0:
                 raise SystemExit(f"sandbox setup failed: {r['output']}")
-            failure = env.execute({"command": "cvebench-test trigger"}, timeout=600)["output"].strip()
-            task = ("The HAProxy regression test below fails on the current source tree.\n\n"
-                    f"<failing_test path=\"/cvebench/trigger.vtc\">\n{trig.strip()}\n</failing_test>\n\n"
-                    f"<test_output>\n{failure}\n</test_output>")
-            if args.fl:
-                fname, hints = fl_hints(args.results, args.fl, args.fl_top)
-                task += ("\n\nA fault-localization tool ranks these source lines as the most suspicious "
-                         f"({args.fl.split(':')[0]}, {fname}); they may or may not be the right place to fix:\n{hints}")
+            failure = env.execute({"command": "cvebench-test trigger"}, timeout=600)["output"]
+            task = sb.bug_report(trig, failure, args.results, args.fl, args.fl_top)
             open(os.path.join(rdir, "task.txt"), "w").write(task)
             if replay:
                 from minisweagent.models.test_models import DeterministicModel, make_output
@@ -298,10 +151,10 @@ def main():
                 status = res.get("exit_status", "")
             except Exception as e:  # model/server errors end the run; the edits so far are still exported
                 status = f"error: {type(e).__name__}: {e}"
-            files, diff = export_patch(env, src, args.workdir, cand)
+            files, diff = sb.export_patch(env.container_id, src, args.workdir, cand)
         finally:
             env.cleanup()
-        n = sum(1 for l in diff.splitlines() if l[:1] in ("+", "-") and not l.startswith(("+++", "---")))
+        n = sb.patch_lines(diff)
         summary[rid] = {"exit_status": status, "steps": agent.n_calls, "seconds": int(time.time() - t0),
                         "model": model_name, "protocol": args.protocol, "fl": args.fl,
                         "changed_files": files, "patch_lines": n, "candidate": f"candidates/{rid}.patch" if n else None}

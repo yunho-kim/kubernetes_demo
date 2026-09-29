@@ -38,6 +38,7 @@ framework/
 │   ├── llmao/                # LLMAO (ICSE 2024): test-free LLM fault localization
 │   ├── autofl/               # AutoFL (FSE 2024): LLM agent with code-navigation tools, ported to C
 │   ├── miniswe/              # mini-swe-agent (2025): LLM agent that edits/tests in a sandbox of the buggy image
+│   ├── openhands/            # OpenHands (ICLR 2025): CodeAct agent (terminal + file editor) on a sandboxed tree
 │   └── oracle/               # reference APR adapter (upstream fix + empty patch)
 └── projects/haproxy/
     ├── commit-db             # bid,cve,fixed_version,fix_commit,cwe,cvss,summary
@@ -107,6 +108,9 @@ $cvebench apr      -p haproxy -b 3 -t oracle             # adapter-driven: check
 $cvebench prepare  -t miniswe                            # one-off: venv with mini-swe-agent (+ litellm)
 OPENAI_BASE_URL=http://127.0.0.1:8080/v1 OPENAI_API_KEY=none \
 $cvebench apr      -p haproxy -b 3 -t miniswe -- --runs 3 # LLM agent repair in a sandboxed buggy image
+$cvebench prepare  -t openhands                          # one-off: venv with the OpenHands SDK + tools
+LLM_BASE_URL=http://127.0.0.1:8080/v1 LLM_API_KEY=none \
+$cvebench apr      -p haproxy -b 3 -t openhands          # OpenHands CodeAct agent, same sandbox
 $cvebench summary                                        # FL table + APR table
 ```
 
@@ -115,7 +119,7 @@ $cvebench summary                                        # FL table + APR table
 The tool contract (adapter layout, `cvebench` verbs as an API, file schemas,
 validation semantics, portability rules) is specified in
 **[docs/INTEGRATION.md](docs/INTEGRATION.md)**. Reference adapters:
-`framework/tools/flitsr` (FL), `framework/tools/oracle` and `framework/tools/miniswe` (APR).
+`framework/tools/flitsr` (FL), `framework/tools/oracle`, `framework/tools/miniswe` and `framework/tools/openhands` (APR).
 
 ## Bugs
 

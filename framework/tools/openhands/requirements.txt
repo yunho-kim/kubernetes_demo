@@ -1,0 +1,4 @@
+# OpenHands Software Agent SDK (the agent, LLM client, conversation/condenser) and its
+# standard tools (terminal, file_editor, task_tracker). Pinned together.
+openhands-sdk==1.50.0
+openhands-tools==1.50.0

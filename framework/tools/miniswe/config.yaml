@@ -38,7 +38,7 @@ agent:
     ## Environment
 
     - The tree is already built. Two helper commands are on PATH:
-      - `cvebench-build` — rebuilds HAProxy incrementally after your edits and installs it
+      - `cvebench-build` — rebuilds HAProxy incrementally after your edits
         (prints compiler errors if the build fails).
       - `cvebench-test [trigger|all|<reg-tests/...vtc> ...]` — rebuilds, then runs the failing
         test (`trigger`, the default), the failing test plus the related regression tests

@@ -383,6 +383,18 @@ Reference implementations:
   framework/tools/miniswe/selftest.cmds` drives the same loop from scripted
   commands instead of an LLM — a pipeline check that must yield one candidate
   that compiles and is not plausible.
+* `framework/tools/openhands/` — an **agent framework with its own tools**
+  (OpenHands' CodeAct agent via the Software Agent SDK: terminal, file editor,
+  task tracker). Where a tool edits files through its own API rather than the
+  shell, share the tree: the built tree is copied out of the buggy image to a
+  fresh host directory `T` and bind-mounted at the same path `T` in the
+  sandbox, the agent's workspace is `T`, its terminal is an interactive bash
+  *inside* the sandbox (a PTY wrapper around `docker exec -it --user <you>`),
+  and its host-side file editor is confined to `T`. `-- --replay
+  framework/tools/openhands/selftest.jsonl` checks all of this without an LLM.
+
+Shared code for agent adapters: `framework/lib/aprsandbox.py` — helper
+commands, `setup_cmd` (hides the answer, 5.7), `bug_report`, `export_patch`.
 
 ### 5.7 Sandboxing agents and hiding the answer
 
