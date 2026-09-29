@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""run — cvebench APR adapter for mini-swe-agent (SWE-agent team, 2025).
+
+    run <results-dir> <workdir> -o <out-dir> [--runs 1] [--step-limit 80] [--time-limit 3600]
+        [--model M] [--base-url URL] [--protocol tools|text] [--temperature T]
+        [--fl TOOL[:FORMULA]] [--fl-top 10] [--keep-comments] [--no-redact] [--fresh]
+
+LLM endpoint: any model litellm supports. For an OpenAI-compatible server set
+  OPENAI_BASE_URL (or --base-url), OPENAI_API_KEY, and MSWEA_MODEL (or --model) =
+  openai/<served-name>; with only OPENAI_BASE_URL set, the first model the server
+  lists is used. Servers without tool calling: --protocol text.
+
+Pipeline, per run k = 1..R
+  1. sandbox: a container of the bug's buggy image (cvebench:<pid>-<bid>-buggy — the
+     source tree already built with the benchmark's flags, vtest installed), started
+     with --network none; the upstream fix patch and CHANGELOG are deleted from it
+     first. Helper commands cvebench-build / cvebench-test (mounted read-only at
+     /cvebench) rebuild incrementally and run the trigger / relevant tests.
+  2. bug report = the failing test (# comment lines removed, CVE identifiers redacted)
+     + its failure output
+     (run in the sandbox) [+ the top lines of an FL ranking with --fl].
+  3. mini-swe-agent's DefaultAgent runs bash commands in the sandbox until it submits
+     or hits the step / time limit; trajectory -> runs/run<k>/trajectory.json.
+  4. the *.c / *.h files under src/ and include/ it created or changed are copied
+     onto a copy of <workdir> and exported with `cvebench diff`
+     -> candidates/run<k>.patch (runs that changed nothing produce no candidate).
+The harness (cvebench apr) then validates every candidate in a clean image.
+"""
+import argparse
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+VENV_PY = os.path.join(HERE, ".venv", "bin", "python")
+CVEBENCH = os.path.join(FW_ROOT, "bin", "cvebench")
+
+# benchmark build flags (framework/projects/haproxy/build/Dockerfile.minpair) — the
+# sandbox rebuilds incrementally on top of the image's objects, so they must match
+BUILD_SH = r"""#!/usr/bin/env bash
+# cvebench-build — rebuild HAProxy after source edits and install it for vtest.
+cd "$HAPROXY_SRC" || exit 2
+log=/tmp/cvebench-build.log
+if make -j"$(nproc)" TARGET=linux-glibc \
+     USE_OPENSSL= USE_PCRE= USE_PCRE2= USE_ZLIB= USE_LUA= USE_SYSTEMD= \
+     CPU_CFLAGS="-O0" DEBUG_CFLAGS="-g3 -fno-inline -fprofile-arcs -ftest-coverage" \
+     LDFLAGS="-fprofile-arcs -ftest-coverage" __EXTRA_MAKE__ >"$log" 2>&1; then
+  cp haproxy /usr/local/bin/haproxy.real && echo "build OK"
+else
+  echo "BUILD FAILED:"; grep -E 'error|Error|undefined reference' "$log" | head -40
+  exit 1
+fi
+"""
+
+TEST_SH = r"""#!/usr/bin/env bash
+# cvebench-test [trigger|all|<vtc> ...] — rebuild, then run reg-tests with vtest.
+ulimit -n 65536 2>/dev/null || ulimit -n 4096 2>/dev/null || true
+cvebench-build >/tmp/cvebench-build.out || { cat /tmp/cvebench-build.out; exit 1; }
+cd "$HAPROXY_SRC" || exit 2
+[ $# -eq 0 ] && set -- trigger
+list=()
+for a in "$@"; do
+  case "$a" in
+    trigger) list+=(/cvebench/trigger.vtc) ;;
+    all) list+=(/cvebench/trigger.vtc)
+         while IFS= read -r v; do list+=("$v"); done < /tmp/relevant_vtc.txt ;;
+    *) list+=("$a") ;;
+  esac
+done
+fail=0
+for vtc in "${list[@]}"; do
+  HAPROXY_PROGRAM=/usr/local/bin/haproxy timeout -s KILL 60 vtest "$vtc" >/tmp/v.log 2>&1
+  case "$?" in
+    0) echo "PASS $vtc" ;;
+    77) echo "SKIP $vtc" ;;
+    *) fail=$((fail+1)); echo "FAIL $vtc"
+       grep -E '^---- |^\*\*\*  [a-z0-9]+ +debug\|.*(error|alert|Fatal|ALERT)' /tmp/v.log | tail -8 | sed 's/^/    /' ;;
+  esac
+done
+echo "== ${#list[@]} test(s), $fail failed"
+[ $fail -eq 0 ]
+"""
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def default_model(base_url):
+    try:
+        with urllib.request.urlopen(base_url.rstrip("/") + "/models", timeout=10) as r:
+            return "openai/" + json.load(r)["data"][0]["id"]
+    except Exception as e:
+        raise SystemExit(f"no --model / MSWEA_MODEL and cannot list models at {base_url}: {e}")
+
+
+def fl_hints(results, spec, top):
+    tool, _, formula = spec.partition(":")
+    p = os.path.join(results, "fl", tool, "ranking.json")
+    if not os.path.exists(p):
+        raise SystemExit(f"--fl {spec}: {p} not found (cvebench fl -t {tool})")
+    fs = json.load(open(p))["formulas"]
+    name = formula or next(iter(fs))
+    if name not in fs:
+        raise SystemExit(f"--fl {spec}: no formula {name} in {p} (have: {', '.join(fs)})")
+    rows = fs[name]["top"][:top]
+    return name, "\n".join(f"  {i + 1}. {r['file']}:{r['line']}" for i, r in enumerate(rows))
+
+
+def export_patch(env, src, workdir, out_patch):
+    """Copy the sandbox's changed/new src|include *.c/*.h onto a copy of workdir -> cvebench diff."""
+    cid = env.container_id
+    r = subprocess.run(["docker", "exec", cid, "bash", "-c",
+                        f"cd {src} && find src include \\( -name '*.c' -o -name '*.h' \\) -newer /tmp/.cvebench-start -print0 "
+                        "| tar --null -T - -cf -"], capture_output=True)
+    names = []
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = os.path.join(tmp, "wd")
+        shutil.copytree(workdir, wd, symlinks=True)
+        tree = os.path.join(wd, os.path.basename(src))
+        if r.stdout:
+            with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
+                members = [m for m in tf.getmembers() if m.isfile() and not m.name.startswith(("/", ".."))]
+                names = [m.name for m in members]
+                tf.extractall(tree, members=members, filter="data")
+        diff = sh([CVEBENCH, "diff", "-w", wd]).stdout if names else ""
+    if diff.strip():
+        with open(out_patch, "w") as fh:
+            fh.write(diff)
+    return names, diff
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("results")
+    ap.add_argument("workdir")
+    ap.add_argument("-o", "--out-dir", required=True)
+    ap.add_argument("--runs", type=int, default=1, help="independent agent runs (one candidate each)")
+    ap.add_argument("--step-limit", type=int, default=80, help="max LLM calls per run")
+    ap.add_argument("--time-limit", type=int, default=3600, help="wall-clock seconds per run")
+    ap.add_argument("--model", default=os.getenv("MSWEA_MODEL"))
+    ap.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL"))
+    ap.add_argument("--protocol", default="tools", choices=("tools", "text"))
+    ap.add_argument("--temperature", type=float, default=None)
+    ap.add_argument("--fl", default=None, metavar="TOOL[:FORMULA]",
+                    help="add the top lines of results/<bug>/fl/TOOL/ranking.json to the bug report")
+    ap.add_argument("--fl-top", type=int, default=10)
+    ap.add_argument("--no-redact", action="store_true",
+                    help="show CVE identifiers in the test to the model (default: CVE-XXXX-XXXXX)")
+    ap.add_argument("--keep-comments", action="store_true",
+                    help="keep the trigger test's # comments (default: removed — they describe the fix)")
+    ap.add_argument("--fresh", action="store_true", help="redo runs that already have a trajectory")
+    ap.add_argument("--replay", default=None, metavar="FILE",
+                    help="no LLM: issue the bash commands in FILE (one per line) and submit — a pipeline self-test "
+                         "(e.g. selftest.cmds)")
+    args = ap.parse_args()
+
+    if not os.access(VENV_PY, os.X_OK):
+        raise SystemExit(f"miniswe venv missing — run {HERE}/prepare.sh (cvebench prepare -t miniswe)")
+    if os.path.realpath(sys.prefix) != os.path.realpath(os.path.join(HERE, ".venv")):  # re-exec inside the venv
+        os.execv(VENV_PY, [VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
+
+    os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
+    os.environ.setdefault("MSWEA_COST_TRACKING", "ignore_errors")
+    import yaml
+    from pathlib import Path
+    from minisweagent.agents.default import DefaultAgent
+    from minisweagent.environments.docker import DockerEnvironment
+    from minisweagent.models.litellm_model import LitellmModel
+    from minisweagent.models.litellm_textbased_model import LitellmTextbasedModel
+
+    with open(os.path.join(args.workdir, "cvebench.bug")) as fh:
+        pid, bid, variant = fh.read().split()
+    if variant != "buggy":
+        raise SystemExit(f"workdir is a {variant} checkout; APR needs -v buggy")
+    pdir = os.path.join(FW_ROOT, "projects", pid)
+    version = next(l.split(",")[2] for l in open(os.path.join(pdir, "commit-db")) if l.startswith(f"{bid},"))
+    src = f"/build/haproxy-{version}"
+    img = f"cvebench:{pid}-{bid}-buggy"
+    if sh(["docker", "image", "inspect", img]).returncode != 0:
+        print(f"[miniswe] building {img} (sandbox image)", flush=True)
+        if subprocess.run([CVEBENCH, "compile", "-p", pid, "-b", bid]).returncode != 0:
+            raise SystemExit(f"cannot build {img}")
+
+    replay = [l.rstrip("\n") for l in open(args.replay) if l.strip() and not l.startswith("#")] if args.replay else None
+    model_name = "replay" if replay else args.model or (default_model(args.base_url) if args.base_url else None)
+    if not model_name:
+        raise SystemExit("no model: set MSWEA_MODEL (litellm name) or OPENAI_BASE_URL")
+    cfg = yaml.safe_load(open(os.path.join(HERE, "config.yaml")))
+    out_dir = os.path.abspath(args.out_dir)
+    os.makedirs(os.path.join(out_dir, "candidates"), exist_ok=True)
+
+    # ---- sandbox helpers (mounted read-only at /cvebench)
+    sbx = os.path.join(out_dir, "sandbox")
+    os.makedirs(os.path.join(sbx, "bin"), exist_ok=True)
+    extra_make = ""
+    benv = os.path.join(pdir, "tests", bid, "build.env")
+    if os.path.exists(benv):
+        m = re.search(r'^EXTRA_MAKE="?([^"\n]*)"?', open(benv).read(), re.M)
+        extra_make = m.group(1) if m else ""
+    for name, body in (("cvebench-build", BUILD_SH.replace("__EXTRA_MAKE__", extra_make)), ("cvebench-test", TEST_SH)):
+        p = os.path.join(sbx, "bin", name)
+        with open(p, "w") as fh:
+            fh.write(body)
+        os.chmod(p, 0o755)
+    trig = open(os.path.join(args.workdir, "cvebench-tests", "trigger.vtc")).read()
+    if not args.keep_comments:  # the crafted triggers' comments explain buggy vs fixed behaviour (and name functions)
+        trig = "".join(l for l in trig.splitlines(keepends=True) if not l.lstrip().startswith("#"))
+    if not args.no_redact:
+        trig = re.sub(r"CVE-\d{4}-\d+", "CVE-XXXX-XXXXX", trig)
+    open(os.path.join(sbx, "trigger.vtc"), "w").write(trig)
+    # related regression tests = trigger + relevant ids, resolved to vtc paths in the sandbox
+    ids = set()
+    for f in ("trigger_tests", "relevant_tests"):
+        p = os.path.join(pdir, f, bid)
+        if os.path.exists(p):
+            ids |= {l.strip() for l in open(p) if l.strip()}
+    open(os.path.join(sbx, "relevant_ids.txt"), "w").write("\n".join(sorted(ids)) + "\n")
+    globs = [l.strip() for l in open(os.path.join(pdir, "tests", bid, "regtests.txt")) if l.strip() and not l.lstrip().startswith("#")]
+    open(os.path.join(sbx, "globs.txt"), "w").write("\n".join(globs) + "\n")
+
+    setup = (f"rm -f /tmp/fix.patch /tmp/candidate.patch {src}/CHANGELOG && "
+             f"cd {src} && ls $(cat /cvebench/globs.txt) 2>/dev/null | sort -u | while read -r v; do "
+             "id=$(printf '%s' \"$v\" | sed 's#reg-tests/##; s#[/.]#_#g'); "
+             "grep -qx \"$id\" /cvebench/relevant_ids.txt && echo \"$v\"; done > /tmp/relevant_vtc.txt; "
+             "touch /tmp/.cvebench-start")
+
+    summary_p = os.path.join(out_dir, "miniswe.json")
+    summary = json.load(open(summary_p)) if os.path.exists(summary_p) else {}
+    model_kwargs = {"drop_params": True}
+    if args.base_url and model_name.startswith("openai/"):
+        model_kwargs["api_base"] = args.base_url
+        model_kwargs["api_key"] = os.getenv("OPENAI_API_KEY", "none")
+    if args.temperature is not None:
+        model_kwargs["temperature"] = args.temperature
+    if args.protocol == "tools":
+        model_kwargs["parallel_tool_calls"] = True
+    mcfg = {k: v for k, v in cfg["model"].items() if not k.startswith("format_error_template")}
+    mcfg["format_error_template"] = cfg["model"][f"format_error_template_{args.protocol}"]
+    Model = LitellmModel if args.protocol == "tools" else LitellmTextbasedModel
+
+    for k in range(1, args.runs + 1):
+        rid = f"run{k}"
+        rdir = os.path.join(out_dir, "runs", rid)
+        traj = os.path.join(rdir, "trajectory.json")
+        if os.path.exists(traj) and not args.fresh:
+            print(f"[miniswe] {rid}: done before (trajectory exists; --fresh to redo)", flush=True)
+            continue
+        os.makedirs(rdir, exist_ok=True)
+        cand = os.path.join(out_dir, "candidates", f"{rid}.patch")
+        if os.path.exists(cand):
+            os.remove(cand)
+        env = DockerEnvironment(
+            image=img, cwd=src, timeout=cfg["environment"]["timeout"],
+            interpreter=cfg["environment"]["interpreter"], env=cfg["environment"]["env"],
+            run_args=["--rm", "--network", "none", "--ulimit", "nofile=65536:65536", "--cap-add=SYS_PTRACE",
+                      "-v", f"{sbx}:/cvebench:ro"],
+            container_timeout=f"{args.time_limit + 900}s")
+        t0 = time.time()
+        try:
+            r = env.execute({"command": setup})
+            if r["returncode"] != 0:
+                raise SystemExit(f"sandbox setup failed: {r['output']}")
+            failure = env.execute({"command": "cvebench-test trigger"}, timeout=600)["output"].strip()
+            task = ("The HAProxy regression test below fails on the current source tree.\n\n"
+                    f"<failing_test path=\"/cvebench/trigger.vtc\">\n{trig.strip()}\n</failing_test>\n\n"
+                    f"<test_output>\n{failure}\n</test_output>")
+            if args.fl:
+                fname, hints = fl_hints(args.results, args.fl, args.fl_top)
+                task += ("\n\nA fault-localization tool ranks these source lines as the most suspicious "
+                         f"({args.fl.split(':')[0]}, {fname}); they may or may not be the right place to fix:\n{hints}")
+            open(os.path.join(rdir, "task.txt"), "w").write(task)
+            if replay:
+                from minisweagent.models.test_models import DeterministicModel, make_output
+                model = DeterministicModel(outputs=[make_output("replay", [{"command": c}], cost=0.0)
+                                                    for c in replay + ["echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"]],
+                                           observation_template=mcfg["observation_template"], cost_per_call=0.0)
+            else:
+                model = Model(model_name=model_name, model_kwargs=model_kwargs, cost_tracking="ignore_errors", **mcfg)
+            agent = DefaultAgent(
+                model,
+                env, system_template=cfg["agent"]["system_template"], instance_template=cfg["agent"]["instance_template"],
+                step_limit=args.step_limit, cost_limit=0, wall_time_limit_seconds=args.time_limit,
+                output_path=Path(traj))
+            print(f"[miniswe] {pid}-{bid} {rid}: agent start ({model_name}, {args.protocol}, "
+                  f"≤{args.step_limit} steps, ≤{args.time_limit}s)", flush=True)
+            try:
+                res = agent.run(task, src=src, protocol=args.protocol)
+                status = res.get("exit_status", "")
+            except Exception as e:  # model/server errors end the run; the edits so far are still exported
+                status = f"error: {type(e).__name__}: {e}"
+            files, diff = export_patch(env, src, args.workdir, cand)
+        finally:
+            env.cleanup()
+        n = sum(1 for l in diff.splitlines() if l[:1] in ("+", "-") and not l.startswith(("+++", "---")))
+        summary[rid] = {"exit_status": status, "steps": agent.n_calls, "seconds": int(time.time() - t0),
+                        "model": model_name, "protocol": args.protocol, "fl": args.fl,
+                        "changed_files": files, "patch_lines": n, "candidate": f"candidates/{rid}.patch" if n else None}
+        json.dump(summary, open(summary_p, "w"), indent=2)
+        print(f"[miniswe] {rid}: {status}, {agent.n_calls} steps, {summary[rid]['seconds']}s, "
+              f"changed {files or 'nothing'} -> " + (f"candidates/{rid}.patch ({n} lines)" if n else "no candidate"),
+              flush=True)
+
+
+if __name__ == "__main__":
+    main()

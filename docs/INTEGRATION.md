@@ -365,9 +365,41 @@ needs. Results land under `apr/<tool>/` exactly as for adapters, so
 2. Each `apr/<tool>/<candidate>/validation.json` exists; `cvebench summary -t <tool>` lists them.
 3. The tool never reads `patches/<bid>.fix.patch`, `fixed/` or a fixed checkout (except the reference `oracle` tool, whose whole point is to do so).
 
-Reference implementation: `framework/tools/oracle/` — emits the upstream fix
-(must validate as plausible) and an empty patch (must not). Use it to check
-the pipeline on a new machine and as a template.
+Reference implementations:
+
+* `framework/tools/oracle/` — emits the upstream fix (must validate as
+  plausible) and an empty patch (must not). Use it to check the pipeline on a
+  new machine and as a template.
+* `framework/tools/miniswe/` — an **LLM agent that edits and tests the program
+  itself** (mini-swe-agent). The agent loop runs on the host (venv); every bash
+  command it issues runs in a sandbox container started from the bug's
+  **buggy image** (`cvebench:<pid>-<bid>-buggy`, see 5.7), where the tree is
+  already built with the benchmark's flags and helper commands
+  `cvebench-build` / `cvebench-test [trigger|all|<vtc>]` give cheap
+  intermediate feedback. At the end the changed `src/`/`include/` C files are
+  copied onto a copy of `<workdir>` and exported with `cvebench diff` — one
+  candidate per run (`--runs R`). Trajectories are kept under `runs/run<k>/`,
+  per-run status/steps/time in `miniswe.json`. `-- --replay
+  framework/tools/miniswe/selftest.cmds` drives the same loop from scripted
+  commands instead of an LLM — a pipeline check that must yield one candidate
+  that compiles and is not plausible.
+
+### 5.7 Sandboxing agents and hiding the answer
+
+Agents that execute commands should do so in a container of the bug's buggy
+image rather than on the host: it has the toolchain and `vtest`, keeps the
+agent away from the host, and is the software-under-test image (so it does
+not violate rule 6.2). When doing so, remove what would reveal the fix:
+
+* `/tmp/fix.patch` — the upstream fix the image build reverse-applied;
+* `CHANGELOG` of the fixed release (it lists the fix commit's subject);
+* network access (`docker run --network none`) — upstream sources are online;
+* the crafted trigger tests' `#` comments (they describe buggy vs fixed
+  behaviour and sometimes name the fixed function) and CVE identifiers.
+
+The release version (`VERSION`) cannot be hidden without changing the build;
+results of LLM-based tools on these public CVEs may still be influenced by
+memorisation — report it as a threat to validity.
 
 ---
 
@@ -377,7 +409,8 @@ the pipeline on a new machine and as a template.
   `docker` is installed by `prepare.sh` into `framework/tools/<tool>/`.
   Pin versions (`requirements.txt`, git tags, checksums).
 * **No dedicated containers for the tool itself.** The harness already uses
-  Docker for the software under test; tools run on the host. A tool that needs
+  Docker for the software under test; tools run on the host. (Running an
+  agent's commands in a container of the bug's own image — 5.7 — is fine.) A tool that needs
   the *program under test* built differently (another compiler, an
   instrumentation plugin — e.g. `mbfl` compiles HAProxy with clang + Mull) may
   build such a variant image from its `prepare.sh`/`run`, the way the coverage

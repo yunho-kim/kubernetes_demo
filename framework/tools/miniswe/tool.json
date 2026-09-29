@@ -1,0 +1,8 @@
+{
+  "name": "miniswe",
+  "kind": "apr",
+  "description": "mini-swe-agent: a minimal bash-only LLM agent; works in a sandbox of the bug's buggy image (build tools + vtest, no network), may build and run the trigger test, and its edits to src/ and include/ are exported as a candidate patch per run",
+  "reference": "J. Yang, C. E. Jimenez, A. Wettig, K. Lieret, S. Yao, K. Narasimhan, O. Press. SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering. NeurIPS 2024 (mini-swe-agent: the minimal successor from the same team, 2025).",
+  "url": "https://github.com/SWE-agent/mini-swe-agent",
+  "granularity": "patch"
+}

@@ -1,0 +1,6 @@
+# Pipeline self-test for `run --replay selftest.cmds` (no LLM): look around, make a
+# harmless edit, rebuild + run the trigger, submit. Expected: one candidate that
+# compiles and is NOT plausible (the trigger still fails).
+ls /cvebench /cvebench/bin && test ! -e /tmp/fix.patch && test ! -e CHANGELOG && echo hidden-ok
+printf '\n/* cvebench miniswe self-test edit */\n' >> src/haproxy.c
+cvebench-test trigger; true
