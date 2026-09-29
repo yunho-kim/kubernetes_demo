@@ -1,5 +1,5 @@
-"""aprsandbox — shared pieces of the agent-style APR adapters (framework/tools/miniswe,
-framework/tools/openhands). Stdlib only.
+"""aprsandbox — shared pieces of the APR adapters that build and test the program in the
+bug's image (framework/tools/miniswe, openhands, darjeeling). Stdlib only.
 
 An agent's commands run in a sandbox container of the bug's buggy image
 (cvebench:<pid>-<bid>-buggy: the source tree already built with the benchmark's
@@ -31,15 +31,16 @@ DOCKER_ARGS = ["--network", "none", "--ulimit", "nofile=65536:65536", "--cap-add
 
 # benchmark build flags (framework/projects/haproxy/build/Dockerfile.minpair) — the
 # sandbox rebuilds incrementally on top of the image's objects, so they must match.
+MAKE_ARGS = ('TARGET=linux-glibc USE_OPENSSL= USE_PCRE= USE_PCRE2= USE_ZLIB= USE_LUA= USE_SYSTEMD= '
+             'CPU_CFLAGS="-O0" DEBUG_CFLAGS="-g3 -fno-inline -fprofile-arcs -ftest-coverage" '
+             'LDFLAGS="-fprofile-arcs -ftest-coverage"')
+
 # gcov data of the instrumented build is redirected to /tmp (GCOV_PREFIX).
 BUILD_SH = r"""#!/usr/bin/env bash
 # cvebench-build — rebuild HAProxy after source edits ($HAPROXY_SRC/haproxy).
 cd "$HAPROXY_SRC" || exit 2
 log=/tmp/cvebench-build.log
-if make -j"$(nproc)" TARGET=linux-glibc \
-     USE_OPENSSL= USE_PCRE= USE_PCRE2= USE_ZLIB= USE_LUA= USE_SYSTEMD= \
-     CPU_CFLAGS="-O0" DEBUG_CFLAGS="-g3 -fno-inline -fprofile-arcs -ftest-coverage" \
-     LDFLAGS="-fprofile-arcs -ftest-coverage" __EXTRA_MAKE__ >"$log" 2>&1; then
+if make -j"$(nproc)" __MAKE_ARGS__ >"$log" 2>&1; then
   echo "build OK"
 else
   echo "BUILD FAILED:"; grep -E 'error|Error|undefined reference' "$log" | head -40
@@ -105,16 +106,21 @@ class Bug:
                 raise SystemExit(f"cannot build {self.image}")
 
 
+def make_args(bug):
+    """The benchmark's make arguments for this bug (MAKE_ARGS + tests/<bid>/build.env EXTRA_MAKE)."""
+    extra = ""
+    benv = os.path.join(bug.pdir, "tests", bug.bid, "build.env")
+    if os.path.exists(benv):
+        m = re.search(r'^EXTRA_MAKE="?([^"\n]*)"?', open(benv).read(), re.M)
+        extra = m.group(1) if m else ""
+    return f"{MAKE_ARGS} {extra}".strip()
+
+
 def write_helpers(bug, sbx, keep_comments=False, redact=True):
     """Populate <sbx> (mounted read-only at /cvebench): bin/, trigger.vtc, relevant ids,
     reg-test globs. Returns the failing test's text as the agent sees it."""
     os.makedirs(os.path.join(sbx, "bin"), exist_ok=True)
-    extra_make = ""
-    benv = os.path.join(bug.pdir, "tests", bug.bid, "build.env")
-    if os.path.exists(benv):
-        m = re.search(r'^EXTRA_MAKE="?([^"\n]*)"?', open(benv).read(), re.M)
-        extra_make = m.group(1) if m else ""
-    for name, body in (("cvebench-build", BUILD_SH.replace("__EXTRA_MAKE__", extra_make)), ("cvebench-test", TEST_SH)):
+    for name, body in (("cvebench-build", BUILD_SH.replace("__MAKE_ARGS__", make_args(bug))), ("cvebench-test", TEST_SH)):
         p = os.path.join(sbx, "bin", name)
         with open(p, "w") as fh:
             fh.write(body)

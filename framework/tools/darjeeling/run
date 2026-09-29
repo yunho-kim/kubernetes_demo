@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""run — cvebench APR adapter for Darjeeling (squaresLab; GenProg-style search-based repair).
+
+    run <results-dir> <workdir> -o <out-dir> [--search genetic|exhaustive]
+        [--metric genprog|ochiai|tarantula|jaccard] [--max-lines 300] [--population 40] [--generations 10]
+        [--max-candidates N] [--time-limit 60] [--threads T] [--seed 0] [--runs 1]
+        [--continue] [--fresh]
+
+Needs the bug's coverage (cvebench coverage): Darjeeling's fault localization and its
+dead-code / test-selection optimisations use the benchmark's per-test line coverage,
+handed over as a Darjeeling coverage file (coverage.load-from-file) instead of
+re-instrumenting the program.
+
+Pipeline, per run k = 1..R (seed = --seed + k - 1)
+  1. program image cvebench-darjeeling:<bug>-<recipe hash> = the bug's buggy image (tree
+     built with the benchmark's flags) + the crafted trigger test at
+     reg-tests/_sbfl_trigger.vtc, a clang compilation database (for Kaskara, from
+     `make -Bn`) and /cvebench/run-test; the leftover upstream fix patch is deleted.
+  2. darjeeling.json (Darjeeling config v1.0; YAML ⊃ JSON):
+       program   tests = the bug's suite (tests.json order, failing first), one shell
+                 test per reg-test (/cvebench/run-test <vtc>); build = incremental make
+       coverage  load-from-file coverage.json (t<i> ↔ tests)
+       localization spectrum, --metric (default genprog: 1.0 failing-only, 0.1 both),
+                 restricted to the --max-lines lines the metric ranks highest (ties: fewer
+                 passing tests first) — Darjeeling enumerates every edit at every localized
+                 line before searching, which does not scale to all ~10k executed lines
+       transformations  delete/replace/append/prepend-statement on C statements indexed
+                 by Kaskara (clang) — GenProg's operators — with Darjeeling's equivalence /
+                 dead-code / scope optimisations. (Darjeeling's `language: text` line edits
+                 are broken at the pinned commit — DeleteLine cannot be instantiated — so
+                 they are not offered.)
+       algorithm genetic (population, generations) or exhaustive; resource limits
+  3. `darjeeling repair` evaluates candidates in containers of the program image (apply
+     patch, rebuild, run failing tests first) and stops at the first acceptable patch
+     (--continue: keep searching). Found patches -> candidates/run<k>-<i>.patch (-p1).
+The harness (cvebench apr) then validates every candidate in a clean image.
+"""
+import argparse
+import collections
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+DARJEELING = os.path.join(HERE, ".venv", "bin", "darjeeling")
+sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
+import aprsandbox as sb  # noqa: E402
+import flcommon as fl  # noqa: E402
+
+KASKARA_VOLUME = "kaskara-clang"
+LOG_CAP = 20 * 2 ** 20  # bytes of Darjeeling output kept in runs/run<k>/darjeeling.log (+ the tail)
+PROGRESS = re.compile(r"\| (?:INFO|SUCCESS) +\| [\w.:]+ - ((?:constructed database|built transformation database|"
+                      r"beginning search|evaluating initial|evaluated initial|found|failed to find|reached|"
+                      r"time taken|# candidate evaluations|# test evaluations).*)$"
+                      r"|\| (?:WARNING|ERROR|CRITICAL) +\| [\w.:]+ - (.*)$")
+SCHEMAS = ["delete-statement", "replace-statement", "append-statement", "prepend-statement"]
+# `make -Bn` compile lines: "cc ... -c -o src/x.o src/x.c" (HAProxy 2.8) or, in older
+# Makefiles, prefixed with the quiet-mode echo: 'echo "  CC      src/x.o";cc ...' (2.4)
+COMPILE_RE = re.compile(r"(?:^|;)\s*((?:cc|gcc|clang)\s.*\s-c\s+-o\s+(\S+\.o)\s+(src/\S+\.c))\s*$")
+
+
+def compile_db(bug):
+    """clang compilation database of the tree in the buggy image, from `make -Bn`."""
+    r = sb.sh(["docker", "run", "--rm", bug.image, "bash", "-c",
+               f"cd {bug.src} && make -Bn {sb.make_args(bug)} 2>/dev/null"])
+    db = []
+    for line in r.stdout.splitlines():
+        m = COMPILE_RE.search(line.strip())
+        if m:
+            db.append({"directory": bug.src, "command": m.group(1), "file": f"{bug.src}/{m.group(3)}"})
+    if not db:
+        raise SystemExit("could not derive compile commands from `make -Bn` in the buggy image")
+    return db
+
+
+def program_image(bug, out_dir):
+    """Build (or reuse) the Darjeeling program image; returns its tag."""
+    ctx = os.path.join(out_dir, "image")
+    os.makedirs(ctx, exist_ok=True)
+    shutil.copy(os.path.join(HERE, "Dockerfile.bug"), os.path.join(ctx, "Dockerfile"))
+    shutil.copy(os.path.join(HERE, "run-test.sh"), os.path.join(ctx, "run-test.sh"))
+    shutil.copy(os.path.join(bug.workdir, "cvebench-tests", "trigger.vtc"), os.path.join(ctx, "trigger.vtc"))
+    with open(os.path.join(ctx, "compile_commands.json"), "w") as fh:
+        json.dump(compile_db(bug), fh, indent=1)
+    base_id = sb.sh(["docker", "image", "inspect", "-f", "{{.Id}}", bug.image]).stdout.strip()
+    h = hashlib.sha1(base_id.encode())
+    for f in sorted(os.listdir(ctx)):
+        h.update(f.encode() + open(os.path.join(ctx, f), "rb").read())
+    tag = f"cvebench-darjeeling:{bug.name}-{h.hexdigest()[:8]}"
+    if sb.sh(["docker", "image", "inspect", tag]).returncode != 0:
+        print(f"[darjeeling] building program image {tag}", flush=True)
+        r = sb.sh(["docker", "build", "-t", tag, "--build-arg", f"BUGGY_IMAGE={bug.image}",
+                   "--build-arg", f"SRC={bug.src}", ctx])
+        if r.returncode != 0:
+            raise SystemExit(f"program image build failed:\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
+    return tag
+
+
+def test_suite(results):
+    """[(id, vtc, outcome, coverage-lines {file: [lines]})], failing tests first."""
+    vtc_of = {}
+    for line in open(os.path.join(results, "buggy", "outcomes.txt")):
+        p = line.split()
+        if len(p) >= 3:
+            vtc_of[p[0]] = p[2]
+    tests = json.load(open(os.path.join(results, "tests.json")))
+    tests.sort(key=lambda t: (t["outcome"] != "fail", t["name"]))
+    suite = []
+    for t in tests:
+        if t["name"] not in vtc_of:
+            continue
+        lines = {}
+        for f, ln in fl.load_coverage(os.path.join(results, t["coverage"])):
+            lines.setdefault(f, []).append(ln)
+        suite.append((t["name"], vtc_of[t["name"]], t["outcome"], {f: sorted(v) for f, v in lines.items()}))
+    return suite
+
+
+KASKARA_CHECK = r"""
+check() { d=$(mktemp -d); cd "$d" || return
+  for a in function-scanner loop-finder statement-finder; do
+    /opt/kaskara/scripts/kaskara-$a "$SRC/$1" >/dev/null 2>&1 || { echo "BAD $1 $a $?"; rm -rf "$d"; return; }
+  done; echo "OK $1"; rm -rf "$d"; }
+export -f check; export SRC; xargs -P "$(nproc)" -I{} bash -c 'check {}'
+"""
+
+
+def kaskara_bad_files(tag, src, files, cache_p):
+    """Files Kaskara's clang indexers crash on (e.g. SIGABRT on HAProxy's src/vars.c).
+    Darjeeling indexes every localized file in one Kaskara call, so a single crash would
+    abort the whole session; these files are excluded from localization instead.
+    Checked once per program image (cached)."""
+    cache = json.load(open(cache_p)) if os.path.exists(cache_p) else {}
+    if cache.get("image") != tag:
+        cache = {"image": tag, "ok": [], "bad": {}}
+    todo = [f for f in files if f not in cache["ok"] and f not in cache["bad"]]
+    if todo:
+        print(f"[darjeeling] checking {len(todo)} file(s) with Kaskara's clang indexers", flush=True)
+        r = subprocess.run(["docker", "run", "--rm", "-i", "-e", f"SRC={src}",
+                            "--mount", f"type=volume,src={KASKARA_VOLUME},dst=/opt/kaskara,readonly",
+                            tag, "bash", "-c", KASKARA_CHECK],
+                           input="\n".join(todo) + "\n", capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            p = line.split()
+            if p[:1] == ["OK"]:
+                cache["ok"].append(p[1])
+            elif p[:1] == ["BAD"]:
+                cache["bad"][p[1]] = f"{p[2]} exit {p[3]}"
+        json.dump(cache, open(cache_p, "w"), indent=1)
+    return {f: why for f, why in cache["bad"].items() if f in files}
+
+
+def suspiciousness(metric, ef, ep, F, P):
+    """Darjeeling's spectrum metrics (darjeeling/localization.py) for ranking the cap."""
+    if metric == "genprog":
+        return 1.0 if ep == 0 else 0.1
+    if metric == "ochiai":
+        return ef / math.sqrt(F * (ef + ep)) if ef else 0.0
+    if metric == "tarantula":
+        a, b = ef / F if F else 0.0, ep / P if P else 0.0
+        return a / (a + b) if a + b else 0.0
+    return ef / (F + ep) if F + ep else 0.0  # jaccard
+
+
+def top_lines(suite, metric, n, skip_files):
+    """The n lines Darjeeling's metric ranks highest (ties: fewer passing tests first,
+    then file/line order), over the lines executed by a failing test."""
+    F = sum(1 for t in suite if t[2] == "fail")
+    P = len(suite) - F
+    ef, ep = collections.Counter(), collections.Counter()
+    for _, _, oc, lines in suite:
+        for f, ls in lines.items():
+            if f in skip_files:
+                continue
+            for ln in ls:
+                (ef if oc == "fail" else ep)[(f, ln)] += 1
+    ranked = sorted(ef, key=lambda k: (-suspiciousness(metric, ef[k], ep[k], F, P), ep[k], k))
+    return ranked[:n], len(ranked)
+
+
+def to_p1(diff):
+    """Darjeeling diffs name files relative to the source root (--- src/h1.c); cvebench
+    candidates are `patch -p1` diffs (--- a/src/h1.c)."""
+    out = []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("--- ") and not line.startswith("--- a/"):
+            line = "--- a/" + line[4:]
+        elif line.startswith("+++ ") and not line.startswith("+++ b/"):
+            line = "+++ b/" + line[4:]
+        out.append(line)
+    return "".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("results")
+    ap.add_argument("workdir")
+    ap.add_argument("-o", "--out-dir", required=True)
+    ap.add_argument("--search", default="genetic", choices=("genetic", "exhaustive"))
+    ap.add_argument("--metric", default="genprog", choices=("genprog", "ochiai", "tarantula", "jaccard"))
+    ap.add_argument("--max-lines", type=int, default=300,
+                    help="restrict localization to the N lines the metric ranks highest (Darjeeling "
+                         "enumerates all edits at all localized lines before searching)")
+    ap.add_argument("--population", type=int, default=40)
+    ap.add_argument("--generations", type=int, default=10)
+    ap.add_argument("--max-candidates", type=int, default=None)
+    ap.add_argument("--time-limit", type=int, default=60, help="minutes per run")
+    ap.add_argument("--threads", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 4)))
+    ap.add_argument("--test-timeout", type=int, default=30,
+                    help="seconds before a reg-test is killed (a hanging trigger costs this per candidate)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--runs", type=int, default=1, help="independent runs with seeds seed, seed+1, ...")
+    ap.add_argument("--continue", dest="cont", action="store_true",
+                    help="keep searching after the first acceptable patch")
+    ap.add_argument("--fresh", action="store_true", help="redo runs that already have a log")
+    args = ap.parse_args()
+
+    if not os.access(DARJEELING, os.X_OK):
+        raise SystemExit(f"darjeeling venv missing — run {HERE}/prepare.sh (cvebench prepare -t darjeeling)")
+    if not os.path.exists(os.path.join(args.results, "tests.json")):
+        raise SystemExit("no coverage for this bug — run `cvebench coverage` first (Darjeeling's FL uses it)")
+    if sb.sh(["docker", "volume", "inspect", KASKARA_VOLUME]).returncode != 0:
+        raise SystemExit(f"docker volume {KASKARA_VOLUME} missing — run {HERE}/prepare.sh")
+
+    bug = sb.Bug(args.workdir)
+    bug.ensure_image("darjeeling")
+    out_dir = os.path.abspath(args.out_dir)
+    os.makedirs(os.path.join(out_dir, "candidates"), exist_ok=True)
+    tag = program_image(bug, out_dir)
+
+    suite = test_suite(os.path.abspath(args.results))
+    with open(os.path.join(out_dir, "tests.txt"), "w") as fh:
+        fh.write("".join(f"t{i}\t{tid}\t{vtc}\t{oc}\n" for i, (tid, vtc, oc, _) in enumerate(suite)))
+    n_fail = sum(1 for t in suite if t[2] == "fail")
+    # the files Darjeeling will localize to (and index with Kaskara): those executed by a failing test
+    loc_files = sorted({f for _, _, oc, lines in suite if oc == "fail" for f in lines})
+    # Darjeeling reads every localized file as UTF-8 and aborts on the first that is not
+    # (HAProxy's include/import/ist.h has a raw 0x80 byte)
+    tree = os.path.join(args.workdir, os.path.basename(bug.src))
+    excluded = {}
+    for f in loc_files:
+        try:
+            open(os.path.join(tree, f), encoding="utf-8").read()
+        except UnicodeDecodeError:
+            excluded[f] = "not UTF-8"
+        except OSError:
+            pass
+    # cap the fault space (Darjeeling builds every edit at every localized line up front):
+    # the --max-lines lines its metric ranks highest, via localization.restrict-to-lines;
+    # files Kaskara cannot index are dropped and the cap refilled
+    while True:
+        lines, n_space = top_lines(suite, args.metric, args.max_lines, excluded)
+        bad = kaskara_bad_files(tag, bug.src, sorted({f for f, _ in lines} - set(excluded)),
+                                os.path.join(out_dir, "kaskara-check.json"))
+        if not bad:
+            break
+        excluded |= bad
+    restrict = {}
+    for f, ln in lines:
+        restrict.setdefault(f, []).append(ln)
+    with open(os.path.join(out_dir, "restrict-to-lines.json"), "w") as fh:
+        json.dump(restrict, fh, indent=1)
+    print(f"[darjeeling] fault space: top {len(lines)} of {n_space} lines by {args.metric} "
+          f"in {len(restrict)} file(s) (--max-lines)", flush=True)
+    if excluded:
+        print("[darjeeling] excluded from localization (Darjeeling/Kaskara cannot process them): "
+              + ", ".join(f"{f} ({w})" for f, w in excluded.items()), flush=True)
+    with open(os.path.join(out_dir, "excluded-files.json"), "w") as fh:
+        json.dump(excluded, fh, indent=1)
+    # Darjeeling loads the source of every file in the failing tests' coverage, so excluded
+    # files leave the problem entirely (they are never edited, and no test's coverage names them)
+    coverage = [{"name": f"t{i}", "lines": {f: v for f, v in lines.items() if f not in excluded},
+                 "outcome": {"successful": outcome == "pass", "time-taken": 1.0}}
+                for i, (_, _, outcome, lines) in enumerate(suite)]
+    with open(os.path.join(out_dir, "coverage.json"), "w") as fh:
+        json.dump(coverage, fh)
+    print(f"[darjeeling] {bug.name}: {len(suite)} tests ({n_fail} failing), "
+          f"{args.search} search, metric {args.metric}", flush=True)
+
+    make = f"make -j4 {sb.make_args(bug)} >/tmp/cvebench-build.log 2>&1"
+    algorithm = {"type": args.search}
+    if args.search == "genetic":
+        algorithm |= {"population": args.population, "generations": args.generations}
+    limits = {"time-minutes": args.time_limit}
+    if args.max_candidates:
+        limits["candidates"] = args.max_candidates
+    cfg = {
+        "version": "1.0",
+        "seed": args.seed,
+        "threads": args.threads,
+        "program": {
+            "image": tag,
+            "language": "c",
+            "source-directory": bug.src,
+            "build-instructions": {"time-limit": 600, "steps": [make], "steps-for-coverage": [make]},
+            "tests": {"type": "shell", "workdir": bug.src, "time-limit": args.test_timeout + 30,
+                      "tests": [f"/cvebench/run-test {vtc} {args.test_timeout}" for _, vtc, _, _ in suite]},
+        },
+        "coverage": {"method": {"type": "gcov"}, "load-from-file": "coverage.json"},
+        "localization": {"type": "spectrum", "metric": args.metric, "exclude-files": sorted(excluded),
+                         "restrict-to-lines": restrict},
+        "algorithm": algorithm,
+        "transformations": {"schemas": [{"type": t} for t in SCHEMAS]},
+        "optimizations": {"ignore-equivalent-insertions": True, "ignore-dead-code": True,
+                          "ignore-string-equivalent-snippets": True},
+        "resource-limits": limits,
+    }
+    with open(os.path.join(out_dir, "darjeeling.json"), "w") as fh:
+        json.dump(cfg, fh, indent=2)
+
+    summary_p = os.path.join(out_dir, "darjeeling-runs.json")
+    summary = json.load(open(summary_p)) if os.path.exists(summary_p) else {}
+    for k in range(1, args.runs + 1):
+        rid, seed = f"run{k}", args.seed + k - 1
+        rdir = os.path.join(out_dir, "runs", rid)
+        log = os.path.join(rdir, "darjeeling.log")
+        if os.path.exists(log) and not args.fresh:
+            print(f"[darjeeling] {rid}: done before (log exists; --fresh to redo)", flush=True)
+            continue
+        shutil.rmtree(rdir, ignore_errors=True)
+        os.makedirs(rdir)
+        for old in os.listdir(os.path.join(out_dir, "candidates")):
+            if old.startswith(f"{rid}-"):
+                os.remove(os.path.join(out_dir, "candidates", old))
+        cmd = [DARJEELING, "repair", os.path.join(out_dir, "darjeeling.json"), "--seed", str(seed),
+               "--threads", str(args.threads), "--patch-dir", os.path.join(rdir, "patches"),
+               "--no-log-to-file", "--log-events-to-file", os.path.join(rdir, "events.csv")]
+        if args.cont:
+            cmd.append("--continue")
+        print(f"[darjeeling] {bug.name} {rid}: search start (seed {seed}, {args.threads} threads, "
+              f"≤{args.time_limit} min)", flush=True)
+        t0 = time.time()
+        with open(log, "w") as out:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                 env=dict(os.environ, PYTHONWARNINGS="ignore"))
+            written, dropped, tail = 0, 0, collections.deque(maxlen=300)
+            for line in p.stdout:
+                if line.startswith(("DEBUG: ", "[DEBUG]")):  # Kaskara's clang trace (millions of lines)
+                    dropped += 1
+                    continue
+                if written < LOG_CAP:
+                    out.write(line)
+                    written += len(line)
+                else:
+                    tail.append(line)
+                    dropped += 1
+                m = PROGRESS.search(line)
+                if m or line.startswith("Traceback") or re.match(r"^\w+(\.\w+)*(Error|Exception): ", line):
+                    print(f"[darjeeling]   {((m.group(1) or m.group(2)) if m else line).rstrip()[:200]}", flush=True)
+            rc = p.wait()
+            if tail:
+                out.write(f"\n[... {dropped} lines dropped by the cvebench adapter; last {len(tail)}:]\n")
+                out.writelines(tail)
+        found = []
+        pdir = os.path.join(rdir, "patches")
+        for fn in sorted(os.listdir(pdir) if os.path.isdir(pdir) else [], key=lambda f: int(f.split(".")[0])):
+            if fn.endswith(".diff"):
+                cand = os.path.join(out_dir, "candidates", f"{rid}-{fn[:-5]}.patch")
+                with open(cand, "w") as fh:
+                    fh.write(to_p1(open(os.path.join(pdir, fn)).read()))
+                found.append(os.path.relpath(cand, out_dir))
+        text = open(log, errors="replace").read()
+        stat = {k: int(m.group(1)) for k, pat in (("candidates_evaluated", r"# candidate evaluations: (\d+)"),
+                                                   ("tests_evaluated", r"# test evaluations: (\d+)"))
+                if (m := re.search(pat, text))}
+        # darjeeling exits 1 when the search ends without an acceptable patch
+        status = ("patch found" if found else "no patch" if "failed to find a patch" in text
+                  else f"error (exit {rc}; see {os.path.relpath(log, out_dir)})")
+        summary[rid] = {"seed": seed, "status": status, "exit_code": rc, "seconds": int(time.time() - t0),
+                        "language": "c", "search": args.search, "metric": args.metric,
+                        "max_lines": args.max_lines, "excluded_files": excluded, **stat, "patches": found}
+        json.dump(summary, open(summary_p, "w"), indent=2)
+        print(f"[darjeeling] {rid}: {status}, {summary[rid]['seconds']}s, "
+              f"{stat.get('candidates_evaluated', '?')} candidates evaluated"
+              + (f" -> {', '.join(found)}" if found else ""), flush=True)
+
+
+if __name__ == "__main__":
+    main()

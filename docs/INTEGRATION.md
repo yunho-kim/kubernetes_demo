@@ -393,8 +393,21 @@ Reference implementations:
   and its host-side file editor is confined to `T`. `-- --replay
   framework/tools/openhands/selftest.jsonl` checks all of this without an LLM.
 
-Shared code for agent adapters: `framework/lib/aprsandbox.py` — helper
-commands, `setup_cmd` (hides the answer, 5.7), `bug_report`, `export_patch`.
+* `framework/tools/darjeeling/` — a **search-based tool that runs the tests
+  itself** (Darjeeling, GenProg-style). It needs the program under test in a
+  Docker image, so `run` derives one from the buggy image (the crafted trigger
+  test, a clang compilation database from `make -Bn`, a one-test runner
+  `/cvebench/run-test <vtc>`), gives Darjeeling the benchmark's coverage as its
+  coverage file (no re-instrumentation), and converts the patches it finds to
+  `patch -p1` candidates. Two scalability adaptations are recorded in the output:
+  the fault space is capped to the `--max-lines` lines Darjeeling's own metric
+  ranks highest (it enumerates every edit at every localized line before
+  searching), and files it cannot process (not UTF-8; Kaskara's clang indexer
+  crashes) are excluded (`excluded-files.json`).
+
+Shared code: `framework/lib/aprsandbox.py` — the benchmark's make arguments,
+helper commands, `setup_cmd` (hides the answer, 5.7), `bug_report`,
+`export_patch`.
 
 ### 5.7 Sandboxing agents and hiding the answer
 
@@ -428,7 +441,9 @@ memorisation — report it as a threat to validity.
   build such a variant image from its `prepare.sh`/`run`, the way the coverage
   build does; the tool's own logic still runs on the host. (If a tool is only
   distributed as an image, `prepare.sh` may pull it and `run` may `docker run`
-  it — document this in `tool.json`.)
+  it — document this in `tool.json`. Example: `darjeeling`'s `prepare.sh` builds
+  Kaskara's clang backend image, which Darjeeling mounts into the program
+  container as a volume.)
 * **Stdlib-only entry points.** `run` may be bash or Python without
   third-party imports; it delegates to the venv.
 * **Deterministic where possible.** Seed randomness and record the seed in the

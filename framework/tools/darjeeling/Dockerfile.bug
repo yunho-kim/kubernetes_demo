@@ -1,0 +1,15 @@
+# Program image for Darjeeling: the bug's buggy image (tree built with the benchmark's
+# flags) plus what Darjeeling needs inside it. Built by `run` (tag carries a recipe hash).
+ARG BUGGY_IMAGE
+FROM ${BUGGY_IMAGE}
+ARG SRC
+# the upstream fix patch the buggy image build reverse-applied (and the empty candidate
+# patch): not needed, and no tool component should be able to pick it up
+RUN rm -f /tmp/fix.patch /tmp/candidate.patch
+# the crafted trigger test, where cvebench's own validation puts it
+COPY trigger.vtc ${SRC}/reg-tests/_sbfl_trigger.vtc
+# clang compilation database for Kaskara (generated from `make -Bn`)
+COPY compile_commands.json ${SRC}/compile_commands.json
+COPY run-test.sh /cvebench/run-test
+RUN chmod 755 /cvebench/run-test
+WORKDIR ${SRC}
