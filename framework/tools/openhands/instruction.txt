@@ -1,0 +1,59 @@
+I have access to a C code repository (HAProxy) in the directory $repo_path . You can explore and modify files using the available tools. Consider the following bug report:
+
+<bug_report>
+$bug_report
+</bug_report>
+
+Can you help me implement the necessary changes to the repository so that the failing test in the <bug_report> passes?
+The failing test is /cvebench/trigger.vtc; its expectations describe the intended behaviour. You DON'T have to modify the testing logic or any of the tests in any way!
+The build environment is already set up for you (the tree is built, and there is no network access), so you don't need to install anything.
+Your task is to make the minimal changes to the program's source files (under src/ and include/ in $repo_path) to ensure the failing test passes without breaking the other regression tests. Only changes to src/ and include/ are kept.
+
+Two helper commands are available in the terminal:
+- `cvebench-build` rebuilds HAProxy incrementally after your edits (it prints compiler errors if the build fails).
+- `cvebench-test [trigger|all|<reg-tests/...vtc> ...]` rebuilds, then runs the failing test (`trigger`, the default), the failing test plus the related regression tests (`all`), or the given tests, and prints PASS/FAIL with vtest's failure messages.
+
+Follow these phases to resolve the issue:
+
+Phase 1. READING: read the problem and reword it in clearer terms
+   1.1 If there are code or config snippets. Express in words any best practices or conventions in them.
+   1.2 Highlight message errors, method names, variables, file names, stack traces, and technical details.
+   1.3 Explain the problem in clear terms.
+   1.4 Enumerate the steps to reproduce the problem.
+   1.5 Highlight any best practices to take into account when testing and fixing the issue
+
+Phase 2. RUNNING: run the failing test with `cvebench-test` and confirm it fails as reported.
+
+Phase 3. EXPLORATION: find the files that are related to the problem and possible solutions
+   3.1 Use `grep` to search for relevant functions, structures, keywords and error messages.
+   3.2 Identify all files related to the problem statement.
+   3.3 Propose the functions and files to fix the issue and explain why.
+   3.4 From the possible file locations, select the most likely location to fix the issue.
+
+Phase 4. TEST CREATION: before implementing any fix, make sure you can reproduce and verify the issue.
+   4.1 Look at the existing regression tests (reg-tests/*.vtc) to understand the test format/structure.
+   4.2 If useful, write an additional small .vtc test (outside src/ and include/) that reproduces the issue.
+   4.3 Run it to confirm you are reproducing the issue.
+
+Phase 5. FIX ANALYSIS: state clearly the problem and how to fix it
+   5.1 State clearly what the problem is.
+   5.2 State clearly where the problem is located.
+   5.3 State clearly how the test reproduces the issue.
+   5.4 State clearly the best practices to take into account in the fix.
+   5.5 State clearly how to fix the problem.
+
+Phase 6. FIX IMPLEMENTATION: Edit the source code to implement your chosen solution.
+   6.1 Make minimal, focused changes to fix the issue. Fix the root cause; do not special-case the test.
+
+Phase 7. VERIFICATION: Test your implementation thoroughly.
+   7.1 Run `cvebench-test` to verify the fix works.
+   7.2 Add edge cases to your own test to ensure comprehensive coverage.
+   7.3 Run `cvebench-test all` to ensure you haven't broken the related regression tests.
+
+8. FINAL REVIEW: Carefully re-read the bug report and review your changes.
+   8.1 Ensure you've fully addressed all requirements.
+   8.2 If any tests fail, revise your implementation until all tests pass.
+
+When you are done, use the finish tool.
+
+Be thorough in your exploration, testing, and reasoning. It's fine if your thinking process is lengthy - quality and completeness are more important than brevity.

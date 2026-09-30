@@ -1,0 +1,8 @@
+{
+  "name": "openhands",
+  "kind": "apr",
+  "description": "OpenHands (CodeAct agent via the OpenHands Software Agent SDK): terminal + file editor + task tracker; the terminal is an interactive bash inside a sandbox of the bug's buggy image (no network) and the file editor is confined to the shared source tree; edits to src/ and include/ are exported as a candidate patch per run",
+  "reference": "X. Wang, B. Li, Y. Song, F. F. Xu, X. Tang, et al., G. Neubig. OpenHands: An Open Platform for AI Software Developers as Generalist Agents. ICLR 2025. SDK: X. Wang et al., The OpenHands Software Agent SDK: A Composable and Extensible Foundation for Production Agents, arXiv 2025.",
+  "url": "https://github.com/OpenHands/software-agent-sdk",
+  "granularity": "patch"
+}
