@@ -405,6 +405,17 @@ Reference implementations:
   searching), and files it cannot process (not UTF-8; Kaskara's clang indexer
   crashes) are excluded (`excluded-files.json`).
 
+* `framework/tools/looprepair/` — a **published tool one of whose stages cannot
+  run on the benchmark** (LoopRepair, ICSE 2026). The part that can — its LLM
+  stage, upstream's `LLMRepair.py` and prompts — is imported unchanged from a
+  pinned clone; the part that cannot — CrashRepair's KLEE/taint analysis of a
+  crashing input — is replaced by benchmark equivalents with the same role in the
+  algorithm (FL ranking → initial locations; the trigger's failure signature → bug
+  type; the trigger's gcov trace on the patched program → taint-trace length and
+  re-localization). Document such substitutions in the adapter (`run`
+  docstring) and in `tool.json`, so results are not mistaken for the original
+  tool's.
+
 Shared code: `framework/lib/aprsandbox.py` — the benchmark's make arguments,
 helper commands, `setup_cmd` (hides the answer, 5.7), `bug_report`,
 `export_patch`.

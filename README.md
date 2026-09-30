@@ -40,6 +40,7 @@ framework/
 │   ├── miniswe/              # mini-swe-agent (2025): LLM agent that edits/tests in a sandbox of the buggy image
 │   ├── openhands/            # OpenHands (ICLR 2025): CodeAct agent (terminal + file editor) on a sandboxed tree
 │   ├── darjeeling/           # Darjeeling: GenProg-style search-based repair (Kaskara/clang statement edits)
+│   ├── looprepair/           # LoopRepair (ICSE 2026): location-aware, trace-guided iterative LLM repair
 │   └── oracle/               # reference APR adapter (upstream fix + empty patch)
 └── projects/haproxy/
     ├── commit-db             # bid,cve,fixed_version,fix_commit,cwe,cvss,summary
@@ -114,6 +115,9 @@ LLM_BASE_URL=http://127.0.0.1:8080/v1 LLM_API_KEY=none \
 $cvebench apr      -p haproxy -b 3 -t openhands          # OpenHands CodeAct agent, same sandbox
 $cvebench prepare  -t darjeeling                         # one-off: venv + Kaskara's clang backend image
 $cvebench apr      -p haproxy -b 2 -t darjeeling -- --time-limit 60   # GenProg-style search (needs cvebench coverage)
+$cvebench prepare  -t looprepair                         # one-off: venv + upstream LoopRepair (LLM stage) + C grammar
+OPENAI_BASE_URL=http://127.0.0.1:8080/v1 OPENAI_API_KEY=none \
+$cvebench apr      -p haproxy -b 3 -t looprepair -- --fl autofl   # iterative LLM repair from an FL ranking
 $cvebench summary                                        # FL table + APR table
 ```
 
@@ -122,7 +126,7 @@ $cvebench summary                                        # FL table + APR table
 The tool contract (adapter layout, `cvebench` verbs as an API, file schemas,
 validation semantics, portability rules) is specified in
 **[docs/INTEGRATION.md](docs/INTEGRATION.md)**. Reference adapters:
-`framework/tools/flitsr` (FL), `framework/tools/oracle`, `framework/tools/miniswe`, `framework/tools/openhands` and `framework/tools/darjeeling` (APR).
+`framework/tools/flitsr` (FL), `framework/tools/oracle`, `framework/tools/miniswe`, `framework/tools/openhands`, `framework/tools/darjeeling` and `framework/tools/looprepair` (APR).
 
 ## Bugs
 
