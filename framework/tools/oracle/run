@@ -8,9 +8,9 @@ APR adapter contract (see docs/INTEGRATION.md):
                  and the test classification; an APR tool may read it, but must
                  not require it.
   <workdir>      a buggy checkout made by `cvebench checkout -v buggy -w <workdir>`:
-                 <workdir>/haproxy-<ver>/   the source tree to repair
+                 <workdir>/<pid>-<ver>/     the source tree to repair (haproxy-2.8.2, kubernetes-1.30.3)
                  <workdir>/cvebench.bug     "<pid> <bid> buggy"
-                 <workdir>/cvebench-tests/  the bug's trigger.vtc + regtests.txt
+                 <workdir>/cvebench-tests/  the bug's projects/<pid>/tests/<bid> (trigger, suite definition)
   <out-dir>      the tool writes candidate patches here as
                  <out-dir>/candidates/<name>.patch  (unified diff, `patch -p1`
                  relative to the source tree root, i.e. a/src/h1.c b/src/h1.c)

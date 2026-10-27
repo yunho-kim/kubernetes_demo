@@ -43,7 +43,26 @@ bug_modified_files() { sed 's#^+++ b/##' <(grep '^+++ b/' "$(proj_dir "$1")/patc
 
 # image tag for a built variant, and the in-image source dir
 bug_image()   { printf 'cvebench:%s-%s-%s' "$1" "$2" "$3"; }   # <pid> <bid> <buggy|fixed>
-bug_srcdir()  { printf '/build/haproxy-%s' "$(bug_fixedver "$1" "$2")"; }
+bug_srcdir()  { printf '/build/%s' "$(p_srcname "$(bug_fixedver "$1" "$2")")"; }
+
+# ---- per-project module (Defects4J's framework/core/Project/<Name>.pm) ----
+# projects/<pid>/project.sh defines how the project's sources are fetched, built
+# into minimal-pair images and tested; PID / BID are set when its hooks run:
+#   p_srcname <ver>                  source dir name inside a checkout / image
+#   p_fetch_src <ver> <dest>         extract the release source into <dest>/<srcname>
+#   p_build <variant> <tag> [cand]   docker build (cand: candidate patch, relative to the project dir)
+#   p_trigger <image>                run the bug's trigger test(s); rc 0 = all pass
+#   p_trigger_ids                    ids of the bug's crafted / declared trigger tests
+#   p_coverage_suite <results-dir>   run the suite on both variants -> buggy/{outcomes.txt,coverage/}, fixed/outcomes.txt
+#   p_validate_run <image> <out-dir> <relevant|full>   outcomes.txt lines on stdout
+#                                    (<out-dir>/relevant.txt = trigger + relevant test ids)
+#   P_DIFF_EXCLUDES=(...)            diff -x patterns for build products (cvebench diff)
+load_project() {
+  local f; f="$(proj_dir "$1")/project.sh"
+  [[ -f "$f" ]] || die "no project module: $f"
+  # shellcheck source=/dev/null
+  source "$f"
+}
 
 # ---- kind cluster ----
 cluster_exists() { kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; }
