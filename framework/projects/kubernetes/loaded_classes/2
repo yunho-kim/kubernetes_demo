@@ -1,0 +1,10 @@
+pkg/kubelet/server/auth.go
+pkg/kubelet/server/metrics/metrics.go
+pkg/kubelet/server/server.go
+pkg/kubelet/server/stats/fs_resource_analyzer.go
+pkg/kubelet/server/stats/handler.go
+pkg/kubelet/server/stats/resource_analyzer.go
+pkg/kubelet/server/stats/summary.go
+pkg/kubelet/server/stats/summary_sys_containers.go
+pkg/kubelet/server/stats/testing/mock_stats_provider.go
+pkg/kubelet/server/stats/volume_stat_calculator.go

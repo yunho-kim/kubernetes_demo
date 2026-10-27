@@ -1,0 +1,3 @@
+# The suite (see tests/1/packages.txt)
+pkg/kubelet/server
+pkg/kubelet/server/stats

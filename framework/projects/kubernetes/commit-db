@@ -1,0 +1,5 @@
+# bid,cve,fixed_version,fix_commit,cwe,cvss,summary
+# buggy = fixed_version source with patches/<bid>.fix.patch reverse-applied (minimal pair)
+1,CVE-2024-10220,1.30.3,50428ed,CWE-22,8.1,kubelet gitRepo volume accepts a nested target directory enabling arbitrary command execution on the node
+2,CVE-2025-0426,1.32.2,302fab7,CWE-400,6.2,kubelet read-only port serves the container checkpoint API (node disk-filling DoS)
+3,CVE-2025-5187,1.33.4,36b3f76,CWE-863,6.7,NodeRestriction lets a node change its own ownerReferences and get itself garbage-collected

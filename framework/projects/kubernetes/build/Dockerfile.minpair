@@ -1,0 +1,43 @@
+# Faithful Defects4J-style minimal pair for Kubernetes: the FIXED release's source
+# (GitHub tag archive, vendored dependencies), and for VARIANT=buggy the upstream fix
+# reverse-applied, so buggy and fixed differ by EXACTLY the fix. The Go build cache
+# is warmed on the fixed source in a shared layer; the variant (and an APR candidate)
+# then rebuilds only the packages the patch touches. Tests run offline (vendor/).
+ARG GO_VERSION
+FROM golang:${GO_VERSION}-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends patch python3 \
+    && rm -rf /var/lib/apt/lists/*
+ENV GOTOOLCHAIN=local GOFLAGS=-mod=vendor GOPROXY=off
+# coverage of a panicking test (see the script)
+COPY build/cover-on-panic.py /tmp/cover-on-panic.py
+RUN python3 /tmp/cover-on-panic.py && rm /tmp/cover-on-panic.py
+
+ARG K8S_VERSION
+WORKDIR /build
+RUN curl -fsSL "https://github.com/kubernetes/kubernetes/archive/refs/tags/v${K8S_VERSION}.tar.gz" | tar xz
+
+# compile = the bug's component binaries + the test binaries of its suite packages
+ARG BUILD_PKGS
+ARG TEST_PKGS
+WORKDIR /build/kubernetes-${K8S_VERSION}
+RUN set -e; for p in $BUILD_PKGS; do go build -o /dev/null "$p"; done; \
+    for p in $TEST_PKGS; do go test -c -o /tmp/warm.test "./$p"; done; rm -f /tmp/warm.test
+
+ARG VARIANT=fixed
+ARG FIX_PATCH
+# APR: an optional candidate patch applied on top of the variant (cvebench validate)
+ARG CANDIDATE_PATCH=build/empty.patch
+COPY "$FIX_PATCH" /tmp/fix.patch
+# buggy = fixed release with the fix reverse-applied (minimal pair)
+RUN if [ "$VARIANT" = "buggy" ]; then \
+        echo "== reverse-applying fix to create BUGGY ==" && patch -R -p1 < /tmp/fix.patch ; \
+    else echo "== FIXED variant (no patch) ==" ; fi; rm -f /tmp/fix.patch
+COPY "$CANDIDATE_PATCH" /tmp/candidate.patch
+RUN if [ -s /tmp/candidate.patch ]; then \
+        echo "== applying CANDIDATE patch ==" && patch -p1 --no-backup-if-mismatch < /tmp/candidate.patch ; fi; \
+    rm -f /tmp/candidate.patch
+RUN set -e; for p in $BUILD_PKGS; do go build -o /dev/null "$p"; done; \
+    for p in $TEST_PKGS; do go test -c -o /tmp/warm.test "./$p"; done; rm -f /tmp/warm.test
+
+ENV K8S_SRC=/build/kubernetes-${K8S_VERSION}
+CMD ["sleep", "infinity"]

@@ -1,0 +1,45 @@
+From 302fab74111c26f9213dbe9550abc4cedf570453
+Subject: Kubelet server handler cleanup
+Upstream: https://github.com/kubernetes/kubernetes/pull/130010 (cherry-pick of #129739 into release-1.32; kubelet v1.32.2)
+Source changes only: the test changes of the same commit (none) stay in both variants.
+---
+diff --git a/pkg/kubelet/server/server.go b/pkg/kubelet/server/server.go
+index 46ac2403d1d60..9121d42f8e3c9 100644
+--- a/pkg/kubelet/server/server.go
++++ b/pkg/kubelet/server/server.go
+@@ -472,17 +472,6 @@ func (s *Server) InstallDefaultHandlers() {
+ 	s.restfulCont.Handle(proberMetricsPath,
+ 		compbasemetrics.HandlerFor(p, compbasemetrics.HandlerOpts{ErrorHandling: compbasemetrics.ContinueOnError}),
+ 	)
+-
+-	// Only enable checkpoint API if the feature is enabled
+-	if utilfeature.DefaultFeatureGate.Enabled(features.ContainerCheckpoint) {
+-		s.addMetricsBucketMatcher("checkpoint")
+-		ws = &restful.WebService{}
+-		ws.Path(checkpointPath).Produces(restful.MIME_JSON)
+-		ws.Route(ws.POST("/{podNamespace}/{podID}/{containerName}").
+-			To(s.checkpoint).
+-			Operation("checkpoint"))
+-		s.restfulCont.Add(ws)
+-	}
+ }
+ 
+ // InstallDebuggingHandlers registers the HTTP request patterns that serve logs or run commands/containers
+@@ -577,6 +566,17 @@ func (s *Server) InstallDebuggingHandlers() {
+ 		To(s.getRunningPods).
+ 		Operation("getRunningPods"))
+ 	s.restfulCont.Add(ws)
++
++	// Only enable checkpoint API if the feature is enabled
++	if utilfeature.DefaultFeatureGate.Enabled(features.ContainerCheckpoint) {
++		s.addMetricsBucketMatcher("checkpoint")
++		ws = &restful.WebService{}
++		ws.Path(checkpointPath).Produces(restful.MIME_JSON)
++		ws.Route(ws.POST("/{podNamespace}/{podID}/{containerName}").
++			To(s.checkpoint).
++			Operation("checkpoint"))
++		s.restfulCont.Add(ws)
++	}
+ }
+ 
+ // InstallDebuggingDisabledHandlers registers the HTTP request patterns that provide better error message

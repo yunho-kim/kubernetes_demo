@@ -1,0 +1,2 @@
+# declared trigger tests (cvebench test): the upstream regression test added by the fix
+pkg/volume/git_repo::TestPlugin

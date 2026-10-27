@@ -1,0 +1,3 @@
+# declared trigger tests (cvebench test): the fix has no upstream test, so a crafted
+# one is copied into the tree from overlay/
+pkg/kubelet/server::TestReadOnlyServerDoesNotServeCheckpoint

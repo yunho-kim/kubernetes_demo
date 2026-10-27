@@ -22,19 +22,21 @@ integrated one way can always be scored like a tool integrated the other way.
 
 | term | meaning in cvebench |
 | --- | --- |
-| project `pid` | the software under test; currently `haproxy` (`framework/projects/haproxy/`) |
-| bug `bid` | one CVE; `haproxy-1`, `haproxy-2`, `haproxy-3`. Metadata: `framework/projects/<pid>/commit-db` |
+| project `pid` | the software under test: `haproxy` (C) and `kubernetes` (Go), under `framework/projects/<pid>/`; `project.sh` there says how it is fetched, built and tested (section 7) |
+| bug `bid` | one CVE; `haproxy-1..3`, `kubernetes-1..3`. Metadata: `framework/projects/<pid>/commit-db` |
 | fixed version | the upstream release that contains the fix |
 | buggy version | the fixed release with `patches/<bid>.fix.patch` **reverse-applied** — buggy and fixed differ by exactly the fix (a *minimal pair*) |
 | trigger tests | tests that **fail on buggy and pass on fixed** (= the CVE reproduction). `trigger_tests/<bid>` |
 | relevant tests | tests that execute at least one modified file. `relevant_tests/<bid>` |
 | modified classes | files touched by the fix. `modified_classes/<bid>` |
 | ground truth | the executable lines the fix touched, line-level (`results/<pid>-<bid>/ground_truth.json`) |
-| test | one HAProxy `reg-tests/**/*.vtc` run under `vtest`; ids are the path with `reg-tests/` stripped and `/`,`.` → `_` (e.g. `http-rules_normalize_uri_vtc`). The crafted trigger is `_sbfl_trigger_vtc` |
+| test (haproxy) | one HAProxy `reg-tests/**/*.vtc` run under `vtest`; ids are the path with `reg-tests/` stripped and `/`,`.` → `_` (e.g. `http-rules_normalize_uri_vtc`). The crafted trigger is `_sbfl_trigger_vtc` |
+| test (kubernetes) | one leaf Go test (a test function, or its innermost `t.Run` subtest) run alone; ids are `<package dir>::<Test>[/<subtest>...]` (Defects4J's `class::method`, e.g. `plugin/pkg/admission/noderestriction::Test_nodePlugin_Admit/forbid_update_of_my_node:_add_owner_reference`). The suite is the packages in `tests/<bid>/packages.txt`; declared triggers are listed in `tests/<bid>/trigger.txt` |
 
-All tests are **behavioural network tests** (HTTP request/response
-expectations), not unit tests or crash reproducers. Plan for a few seconds per
-test and for the whole suite of a bug to take minutes.
+HAProxy tests are **behavioural network tests** (HTTP request/response
+expectations): plan for a few seconds per test and minutes per suite.
+Kubernetes tests are Go unit tests: milliseconds each, a suite in well under a
+minute once the image's build cache is warm.
 
 ---
 
@@ -56,7 +58,7 @@ Non-zero exit = failure (message on stderr).
 ### Building blocks
 | verb | effect |
 | --- | --- |
-| `cvebench checkout -p <pid> -b <bid> -v buggy\|fixed -w <workdir>` | source tree at `<workdir>/haproxy-<ver>/`, plus `<workdir>/cvebench.bug` (`<pid> <bid> <variant>`) and `<workdir>/cvebench-tests/` (trigger.vtc, regtests.txt). Downloads are cached in `results/.cache/` |
+| `cvebench checkout -p <pid> -b <bid> -v buggy\|fixed -w <workdir>` | source tree at `<workdir>/<pid>-<ver>/` (`haproxy-2.8.2/`, `kubernetes-1.33.4/`), plus `<workdir>/cvebench.bug` (`<pid> <bid> <variant>`) and `<workdir>/cvebench-tests/` (a copy of `projects/<pid>/tests/<bid>/`: trigger, suite definition). Downloads are cached in `results/.cache/` |
 | `cvebench compile -p <pid> -b <bid>` | builds the coverage-instrumented `buggy` and `fixed` images (`cvebench:<pid>-<bid>-{buggy,fixed}`) |
 | `cvebench test -p <pid> -b <bid> [-v buggy\|fixed]` | runs the trigger test; on buggy it must fail (CVE reproduced), on fixed pass |
 | `cvebench coverage -p <pid> -b <bid>` | runs the bug's suite on both variants, collects per-test line coverage, classifies tests, writes the GZoltar spectrum, ground truth and the Defects4J metadata files, and runs the built-in SBFL |
@@ -90,8 +92,9 @@ validation; `KIND_CLUSTER` names the kind cluster (default `cvebench`).
 
 Everything a tool consumes or produces is a plain file under
 `results/<pid>-<bid>/`. Paths inside files are **source-relative**
-(`src/h1.c`, `include/haproxy/htx.h`). Only `src/` and `include/` are
-instrumented.
+(`src/h1.c`, `pkg/kubelet/server/server.go`). HAProxy instruments `src/` and
+`include/`; Kubernetes instruments the import paths in `tests/<bid>/coverpkg.txt`
+(`go test -coverpkg`), whose coverage blocks are mapped to the lines they span.
 
 ```
 results/<pid>-<bid>/
@@ -99,8 +102,9 @@ results/<pid>-<bid>/
 ├── classification.json       # {"triggers":[id], "passing":[id], "relevant":[id], "loaded":[file], "excluded":[...]}
 ├── ground_truth.json         # {"files":[...], "lines":[{"file","line"}], "fault_of_omission":bool, "resolution":{...}}
 ├── ground_truth_raw.json     # the same before snapping to executable lines
-├── buggy/outcomes.txt        # "<id> <pass|fail|skip> <vtc>" per test on buggy
-├── buggy/coverage/<id>.json  # {"test": id, "covered": {"src/h1.c": [577, 578, ...], ...}}
+├── buggy/outcomes.txt        # "<id> <pass|fail|skip> <where>" per test on buggy (<where>: .vtc path / package dir)
+├── buggy/coverage/*.json     # one per test: {"test": id, "covered": {"src/h1.c": [577, 578, ...], ...}}
+│                             #   (haproxy names the file <id>.json; find a test's file by its "test" field)
 ├── fixed/outcomes.txt        # outcomes on fixed
 ├── gzoltar/                  # spectrum in GZoltar format
 │   ├── spectra               #   one component per line:  "<file>#<line>"
@@ -126,8 +130,11 @@ buggy ∧ pass on fixed; passing = pass on both; everything else excluded):
 
 `ground_truth.json` — the fix's lines, **snapped to the nearest executable
 (covered) line within 8 lines** so that a line-level ranking can hit them;
-`fault_of_omission` is true when the fix only *adds* code. The raw diff lines
-are in `ground_truth_raw.json`. Tools that rank functions or files should map
+`fault_of_omission` is true when the fix only *adds* code. For inserted code
+the candidates are the buggy lines on either side of the insertion point
+(`"side": "before"|"after"` in `ground_truth_raw.json`), snapped backward /
+forward to the executable statement on that side. The raw diff lines are in
+`ground_truth_raw.json`. Tools that rank functions or files should map
 their output to lines (section 4.5).
 
 Per-bug Defects4J metadata also lives under the project, independent of any
@@ -291,10 +298,11 @@ run <results-dir> <workdir> -o <out-dir> [tool-specific args]
 ```
 
 * `<workdir>` — a **buggy** checkout (`cvebench checkout -v buggy`):
-  `<workdir>/haproxy-<ver>/` is the tree to repair, `<workdir>/cvebench.bug`
-  identifies the bug, `<workdir>/cvebench-tests/trigger.vtc` is the failing
-  test (its expectations describe the intended behaviour). The tool may edit
-  the tree in place.
+  `<workdir>/<pid>-<ver>/` is the tree to repair, `<workdir>/cvebench.bug`
+  identifies the bug, `<workdir>/cvebench-tests/` holds the failing test
+  (haproxy: `trigger.vtc`; kubernetes: `trigger.txt` names upstream tests that
+  are already in the tree, crafted ones are under `overlay/`). Its expectations
+  describe the intended behaviour. The tool may edit the tree in place.
 * `<results-dir>` — may contain FL results (`fl/<tool>/ranking.json`) and the
   test classification for your tool to consume; it may be absent or partial,
   so do not require it.
@@ -316,10 +324,13 @@ run <results-dir> <workdir> -o <out-dir> [tool-specific args]
 For each candidate the harness
 
 1. builds an image from the **buggy** tree with the candidate applied
-   (`compiles` = false if `patch` or `make` fails; see `build.log`),
+   (`compiles` = false if `patch` or the build fails — haproxy: `make`;
+   kubernetes: the component binary and the suite's test binaries; see `build.log`),
 2. runs the trigger test(s) and the bug's relevant tests inside that image
-   (with `--full`, the whole suite listed in `tests/<bid>/regtests.txt`),
-3. records `plausible = compiles ∧ every trigger test passes ∧ no relevant test fails`.
+   (with `--full`, the bug's whole suite: `tests/<bid>/regtests.txt` /
+   `tests/<bid>/packages.txt`),
+3. records `plausible = compiles ∧ every trigger test passes ∧ no relevant test fails`
+   (a trigger that did not run counts as failing).
 
 `plausible` is the Defects4J notion of a *test-adequate* patch. **Correctness
 is not decided by the harness** — compare `candidate.patch` with
@@ -469,26 +480,49 @@ memorisation — report it as a threat to validity.
 | --- | --- |
 | `framework/projects/<pid>/commit-db` | `bid,cve,fixed_version,fix_commit,cwe,cvss,summary` |
 | `patches/<bid>.fix.patch` | the upstream fix (ground truth; APR tools must not read it) |
-| `tests/<bid>/trigger.vtc` | the crafted CVE reproduction test |
-| `tests/<bid>/regtests.txt` | globs of reg-tests that form the bug's suite |
-| `tests/<bid>/build.env` | optional build/coverage knobs (`EXTRA_MAKE`, `COV_TICK`) |
 | `trigger_tests/<bid>`, `relevant_tests/<bid>`, `modified_classes/<bid>`, `loaded_classes/<bid>` | Defects4J-style lists, regenerated by `cvebench coverage` |
+| `project.sh` | the project module: source fetch, image build, trigger / suite runners (below) |
+
+`tests/<bid>/` per project:
+
+| haproxy | kubernetes |
+| --- | --- |
+| `trigger.vtc` — the crafted CVE reproduction test | `trigger.txt` — declared trigger test ids (upstream regression tests, or crafted ones in `overlay/`) |
+| `regtests.txt` — reg-test globs forming the suite | `packages.txt` — package dirs forming the suite |
+| `build.env` — optional `EXTRA_MAKE`, `COV_TICK` | `build.env` — `GO_VERSION` (the tag's `.go-version`), `BUILD_PKGS` (the component built as the compile check) |
+| — | `coverpkg.txt` — import-path patterns instrumented for coverage |
+| — | `overlay/` — files copied into the tree before tests run (crafted triggers) |
+
+The project module `framework/projects/<pid>/project.sh` (Defects4J's
+`Project/<Name>.pm`) is sourced by the harness and defines `p_srcname`,
+`p_fetch_src`, `p_build`, `p_trigger`, `p_trigger_ids`, `p_coverage_suite`,
+`p_validate_run` and `P_DIFF_EXCLUDES` (documented in `framework/lib/cvebench.sh`).
+A new project adds a module plus `commit-db`, `patches/`, `tests/` and `build/`.
 
 Current bugs: `haproxy-1` CVE-2021-40346 (CWE-190, request smuggling),
 `haproxy-2` CVE-2022-0711 (CWE-835, infinite loop), `haproxy-3`
-CVE-2023-45539 (CWE-436, URI `#` misrouting). All three are logic bugs
-observed through behavioural tests — there is no sanitizer crash to localize
-or repair from, which matters for crash-driven techniques.
+CVE-2023-45539 (CWE-436, URI `#` misrouting); `kubernetes-1` CVE-2024-10220
+(CWE-22, kubelet gitRepo volume), `kubernetes-2` CVE-2025-0426 (CWE-400,
+kubelet checkpoint API on the read-only port), `kubernetes-3` CVE-2025-5187
+(CWE-863, NodeRestriction ownerReferences). All are logic bugs observed through
+tests — there is no sanitizer crash to localize or repair from, which matters
+for crash-driven techniques.
 
 ---
 
 ## 8. Known limitations
 
 * Line-level ground truth is snapped to executable lines; fixes that only add
-  code (`fault_of_omission`) are credited to the nearest executed line.
-* Coverage is line coverage from gcov at `-O0`; there is no branch or
-  data-flow information in the spectrum.
-* Validation uses the reg-tests of the bug's suite, not HAProxy's entire
-  test tree; `--full` widens it to `regtests.txt`.
-* A single project (HAProxy, C). The contract is project-agnostic and new
-  projects follow the same `framework/projects/<pid>/` layout.
+  code (`fault_of_omission`) are credited to the executed statements on either
+  side of the insertion point.
+* Coverage is line coverage (gcov at `-O0`; Go coverage blocks mapped to the
+  lines they span); there is no branch or data-flow information in the spectrum.
+* Validation uses the tests of the bug's suite, not the project's entire test
+  tree; `--full` widens it to the whole suite (`regtests.txt` / `packages.txt`).
+* Kubernetes: a test that panics keeps its coverage only when the panic happens
+  in its own goroutine (the images' Go `testing` package writes the profile
+  before re-panicking, `build/cover-on-panic.py`); a panic elsewhere, or a test
+  timeout, loses that test's coverage and the test is excluded.
+* The external FL / APR tools under `framework/tools/` other than `flitsr` and
+  `oracle` are still HAProxy-specific (vtest, gcov, `make`, C parsers); the core
+  harness (`checkout … validate`, `coverage`, built-in SBFL) supports both projects.

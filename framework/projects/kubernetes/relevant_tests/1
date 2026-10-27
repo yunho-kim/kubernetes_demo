@@ -1,0 +1,2 @@
+pkg/volume/git_repo::TestCanSupport
+pkg/volume/git_repo::TestPlugin

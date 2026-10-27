@@ -1,0 +1,7 @@
+# The suite: Go package dirs (relative to the source root) whose tests are run on
+# BOTH buggy and fixed, one leaf test at a time, and classified:
+#   fail-on-buggy & pass-on-fixed -> trigger
+#   pass-on-both                  -> passing test
+#   anything else                 -> excluded (environment, not the bug)
+pkg/volume/git_repo
+pkg/volume/emptydir

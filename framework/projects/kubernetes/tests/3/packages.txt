@@ -1,0 +1,3 @@
+# The suite (see tests/1/packages.txt)
+plugin/pkg/admission/noderestriction
+pkg/auth/nodeidentifier
