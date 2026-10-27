@@ -1,0 +1,10 @@
+# Darjeeling (squaresLab) at a pinned commit — PyPI only has the old 0.1.x series.
+darjeeling @ git+https://github.com/squaresLab/Darjeeling@81803f1dd31f438e71b5fdbf7e18157b3dbe35d8
+# Kaskara exactly as Darjeeling's poetry.lock pins it (a git commit also versioned
+# "0.2.1"): the PyPI 0.2.1 release's C++ backend no longer builds against the current
+# christimperley/llvm18 image.
+kaskara @ git+https://github.com/ChrisTimperley/Kaskara@f8f49db12f04e5c4f482a1ea94b767b701710afe
+# kaskara imports pkg_resources (removed from setuptools >= 81); darjeeling imports
+# typing_extensions without declaring it.
+setuptools<81
+typing_extensions

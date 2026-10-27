@@ -1,0 +1,8 @@
+{
+  "name": "looprepair",
+  "kind": "apr",
+  "description": "LoopRepair: location-aware, trace-guided iterative LLM repair — upstream's LLM stage (repair-sequence prediction + function-level patch generation, 5 samples per location, up to 3 iterations from the best test-failing patches); CrashRepair's crash/KLEE analysis replaced by cvebench FL locations, the trigger's failure signature and its gcov trace on the patched program",
+  "reference": "Z. Ye, X. Sun, S. Cao, L. Bo, B. Li. Well Begun is Half Done: Location-Aware and Trace-Guided Iterative Automated Vulnerability Repair. ICSE 2026 (ACM SIGSOFT Distinguished Paper).",
+  "url": "https://github.com/Fino2020/LoopRepair",
+  "granularity": "patch"
+}

@@ -1,0 +1,8 @@
+{
+  "name": "darjeeling",
+  "kind": "apr",
+  "description": "Darjeeling: language-agnostic search-based repair \u2014 GenProg-style genetic search over delete/replace/append/prepend-statement edits of C statements indexed by Kaskara (clang), spectrum FL from the benchmark's coverage capped to the top-ranked lines, candidates built and tested in containers of a program image derived from the bug's buggy image",
+  "reference": "C. S. Timperley (squaresLab, Carnegie Mellon University). Darjeeling: distributed, language-independent, compositional search-based program repair (software, v0.2.0). Search algorithm and edit operators follow GenProg: C. Le Goues, T. Nguyen, S. Forrest, W. Weimer. GenProg: A Generic Method for Automatic Software Repair. TSE 2012.",
+  "url": "https://github.com/squaresLab/Darjeeling",
+  "granularity": "patch"
+}

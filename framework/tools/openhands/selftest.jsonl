@@ -1,0 +1,8 @@
+# Pipeline self-test for `run --replay selftest.jsonl` (no LLM). Expected: the fix patch and
+# CHANGELOG are gone, the terminal runs as the invoking user inside the sandbox, the file editor
+# refuses a path outside the tree but edits inside it, and the run yields one candidate that
+# compiles and is NOT plausible (the trigger still fails).
+{"tool": "terminal", "args": {"command": "ls /cvebench/bin && test ! -e /tmp/fix.patch && test ! -e CHANGELOG && echo hidden-ok && pwd && id -u"}}
+{"tool": "file_editor", "args": {"command": "view", "path": "/etc/passwd"}}
+{"tool": "file_editor", "args": {"command": "insert", "path": "$TREE/src/haproxy.c", "insert_line": 0, "new_str": "/* cvebench openhands self-test edit */"}}
+{"tool": "terminal", "args": {"command": "cvebench-test trigger; true"}}

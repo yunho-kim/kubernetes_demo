@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""run — cvebench APR adapter for OpenHands (CodeAct agent, OpenHands Software Agent SDK).
+
+    run <results-dir> <workdir> -o <out-dir> [--runs 1] [--max-iterations 100] [--time-limit 3600]
+        [--model M] [--base-url URL] [--temperature T] [--no-native-tools] [--no-condenser]
+        [--llm-timeout 1800] [--fl TOOL[:FORMULA]] [--fl-top 10] [--keep-comments] [--no-redact]
+        [--fresh] [--replay FILE]
+
+LLM endpoint: any model litellm supports. For an OpenAI-compatible server set
+  LLM_BASE_URL or OPENAI_BASE_URL (or --base-url), LLM_API_KEY or OPENAI_API_KEY, and
+  LLM_MODEL (or --model) = openai/<served-name>; with only a base URL, the first model
+  the server lists is used. Servers without native tool calling: --no-native-tools
+  (OpenHands then describes the tools in the prompt and parses the calls from text).
+
+Pipeline, per run k = 1..R
+  1. the built source tree of the bug's buggy image (cvebench:<pid>-<bid>-buggy) is
+     copied to a fresh host directory T (mtimes kept, so rebuilds stay incremental)
+     and bind-mounted at the same path T in a sandbox container of that image
+     (--network none). As root, the sandbox setup deletes the upstream fix patch left
+     by the image build and the CHANGELOG (aprsandbox.setup_cmd).
+  2. OpenHands' default CodeAct agent (system prompt with cli_mode, tools terminal +
+     file_editor + task_tracker, LLM-summarizing condenser as in OpenHands' SWE-bench
+     evaluation) runs on the host with workspace T:
+       * terminal: an interactive bash INSIDE the sandbox (a PTY wrapper around
+         `docker exec -it --user <you>`), with cvebench-build / cvebench-test on PATH;
+       * file_editor: OpenHands' editor on the host, confined to T (= the sandbox tree).
+     The instruction is OpenHands' SWE-bench prompt adapted to a failing regression
+     test (instruction.txt) around the bug report (failing test with # comments removed
+     and CVE ids redacted, its failure output [, FL hints with --fl]). As in the
+     benchmark harness, a message instead of a tool call gets a canned "continue"
+     reply (at most 10); the run ends on finish, the iteration or time limit, or stuck.
+  3. the *.c / *.h files under src/ and include/ it created or changed are exported with
+     `cvebench diff` -> candidates/run<k>.patch (no candidate if nothing changed).
+     Events: runs/run<k>/trajectory.json (+ the SDK's persistence under conversation/).
+The harness (cvebench apr) then validates every candidate in a clean image.
+
+--replay FILE: no LLM — FILE holds JSON lines {"tool": "terminal"|"file_editor"|..., "args": {...}}
+($TREE = the sandbox tree) issued in order, then finish (selftest.jsonl is a pipeline self-test).
+"""
+import argparse
+import json
+import os
+import shutil
+import string
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+VENV_PY = os.path.join(HERE, ".venv", "bin", "python")
+sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
+import aprsandbox as sb  # noqa: E402
+
+SANDBOX_PATH = "/cvebench/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# canned reply when the agent talks instead of acting (OpenHands benchmarks, utils/fake_user_response.py)
+FAKE_USER = ("Please continue working on the task on whatever approach you think is suitable.\n"
+             "When you think you have solved the question, please use the finish tool and "
+             "include your final answer in the message parameter of the finish tool.\n"
+             "IMPORTANT: YOU SHOULD NEVER ASK FOR HUMAN HELP.\n")
+FAKE_USER_GIVE_UP = 'If you want to give up, use the "finish" tool to finish the interaction.\n'
+
+
+def copy_tree(image, src, dest_parent):
+    """Copy the built tree <src> out of <image> into <dest_parent>/ (mtimes preserved)."""
+    cid = subprocess.run(["docker", "create", image], capture_output=True, text=True, check=True).stdout.strip()
+    try:
+        subprocess.run(["docker", "cp", "-q", f"{cid}:{src}", dest_parent], check=True)
+    finally:
+        subprocess.run(["docker", "rm", cid], capture_output=True)
+    return os.path.join(dest_parent, os.path.basename(src))
+
+
+def sandbox_env(tree):
+    return ["-e", "HOME=/tmp", "-e", f"PATH={SANDBOX_PATH}", "-e", f"HAPROXY_SRC={tree}",
+            "-e", "PAGER=cat", "-e", "GIT_PAGER=cat", "-e", "TERM=xterm-256color",
+            "-e", "INPUTRC=/cvebench/inputrc"]  # no bracketed-paste escapes in the terminal output
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("results")
+    ap.add_argument("workdir")
+    ap.add_argument("-o", "--out-dir", required=True)
+    ap.add_argument("--runs", type=int, default=1, help="independent agent runs (one candidate each)")
+    ap.add_argument("--max-iterations", type=int, default=100,
+                    help="max agent steps per run (OpenHands' SWE-bench harness uses 500)")
+    ap.add_argument("--time-limit", type=int, default=3600, help="wall-clock seconds per run")
+    ap.add_argument("--model", default=os.getenv("LLM_MODEL"))
+    ap.add_argument("--base-url", default=os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
+    ap.add_argument("--temperature", type=float, default=None)
+    ap.add_argument("--no-native-tools", action="store_true",
+                    help="the server has no tool calling: describe tools in the prompt instead")
+    ap.add_argument("--no-condenser", action="store_true", help="disable the LLM-summarizing condenser")
+    ap.add_argument("--llm-timeout", type=int, default=1800, help="seconds per LLM request")
+    ap.add_argument("--fl", default=None, metavar="TOOL[:FORMULA]",
+                    help="add the top lines of results/<bug>/fl/TOOL/ranking.json to the bug report")
+    ap.add_argument("--fl-top", type=int, default=10)
+    ap.add_argument("--keep-comments", action="store_true",
+                    help="keep the trigger test's # comments (default: removed — they describe the fix)")
+    ap.add_argument("--no-redact", action="store_true",
+                    help="show CVE identifiers in the test to the model (default: CVE-XXXX-XXXXX)")
+    ap.add_argument("--fresh", action="store_true", help="redo runs that already have a trajectory")
+    ap.add_argument("--replay", default=None, metavar="FILE",
+                    help="no LLM: issue the tool calls in FILE (JSON lines) and finish — a pipeline self-test")
+    args = ap.parse_args()
+
+    if not os.access(VENV_PY, os.X_OK):
+        raise SystemExit(f"openhands venv missing — run {HERE}/prepare.sh (cvebench prepare -t openhands)")
+    if os.path.realpath(sys.prefix) != os.path.realpath(os.path.join(HERE, ".venv")):  # re-exec inside the venv
+        os.execv(VENV_PY, [VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
+
+    os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
+    from pathlib import Path
+    from pydantic import SecretStr
+    from openhands.sdk import LLM, Agent, Conversation, Tool
+    from openhands.sdk.context.condenser import LLMSummarizingCondenser
+    from openhands.sdk.conversation.state import ConversationExecutionStatus
+    from openhands.sdk.event import ActionEvent, MessageEvent
+    from openhands.sdk.tool.builtins.finish import FinishAction
+    from openhands.sdk.tool.registry import register_tool
+    from openhands.tools.file_editor import FileEditorTool
+    from openhands.tools.file_editor.definition import FileEditorObservation
+    from openhands.tools.file_editor.impl import FileEditorExecutor
+    from openhands.tools.task_tracker import TaskTrackerTool
+    from openhands.tools.terminal import TerminalTool
+
+    class ConfinedFileEditorExecutor(FileEditorExecutor):
+        """OpenHands' file editor, refusing paths outside the sandbox tree (it runs on the host)."""
+
+        def __init__(self, root):
+            super().__init__(workspace_root=root)
+            self.root = Path(root).resolve()
+
+        def __call__(self, action, conversation=None):
+            p = Path(action.path)
+            rp = (p if p.is_absolute() else self.root / p).resolve()
+            if rp != self.root and self.root not in rp.parents:
+                return FileEditorObservation.from_text(
+                    text=f"Access denied: {action.path} is outside the repository {self.root}; "
+                         "use the terminal to look at other files.",
+                    command=action.command, is_error=True)
+            return super().__call__(action, conversation)
+
+    class ConfinedFileEditorTool(FileEditorTool):
+        name = FileEditorTool.name
+
+        @classmethod
+        def create(cls, conv_state):
+            root = conv_state.workspace.working_dir
+            return [t.set_executor(ConfinedFileEditorExecutor(root)) for t in FileEditorTool.create(conv_state)]
+
+    register_tool(FileEditorTool.name, ConfinedFileEditorTool)
+
+    bug = sb.Bug(args.workdir)
+    bug.ensure_image("openhands")
+    replay = None
+    if args.replay:
+        replay = [json.loads(l) for l in open(args.replay) if l.strip() and not l.lstrip().startswith("#")]
+    model_name = "replay" if replay else args.model or (sb.default_model(args.base_url) if args.base_url else None)
+    if not model_name:
+        raise SystemExit("no model: set LLM_MODEL (litellm name) or LLM_BASE_URL / OPENAI_BASE_URL")
+    api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ("none" if args.base_url else None)
+    instruction_t = string.Template(open(os.path.join(HERE, "instruction.txt")).read())
+
+    out_dir = os.path.abspath(args.out_dir)
+    os.makedirs(os.path.join(out_dir, "candidates"), exist_ok=True)
+    sbx = os.path.join(out_dir, "sandbox")
+    trig = sb.write_helpers(bug, sbx, keep_comments=args.keep_comments, redact=not args.no_redact)
+    with open(os.path.join(sbx, "inputrc"), "w") as fh:
+        fh.write("set enable-bracketed-paste off\n")
+    summary_p = os.path.join(out_dir, "openhands.json")
+    summary = json.load(open(summary_p)) if os.path.exists(summary_p) else {}
+    uid = f"{os.getuid()}:{os.getgid()}"
+
+    for k in range(1, args.runs + 1):
+        rid = f"run{k}"
+        rdir = os.path.join(out_dir, "runs", rid)
+        traj = os.path.join(rdir, "trajectory.json")
+        if os.path.exists(traj) and not args.fresh:
+            print(f"[openhands] {rid}: done before (trajectory exists; --fresh to redo)", flush=True)
+            continue
+        if os.path.isdir(rdir):
+            shutil.rmtree(rdir)
+        os.makedirs(rdir)
+        cand = os.path.join(out_dir, "candidates", f"{rid}.patch")
+        if os.path.exists(cand):
+            os.remove(cand)
+
+        tmp = tempfile.mkdtemp(prefix="cvebench-sbx-")
+        cid = None
+        t0 = time.time()
+        steps, status, files, diff, cost = 0, "", [], "", 0.0
+        try:
+            tree = copy_tree(bug.image, bug.src, tmp)
+            cid = subprocess.run(
+                ["docker", "run", "-d", "--rm", "--name", f"cvebench-oh-{uuid.uuid4().hex[:8]}", *sb.DOCKER_ARGS,
+                 "-v", f"{tree}:{tree}", "-v", f"{sbx}:/cvebench:ro", "-w", tree, *sandbox_env(tree),
+                 bug.image, "sleep", f"{args.time_limit + 900}s"],
+                capture_output=True, text=True, check=True).stdout.strip()
+            r = sb.sh(["docker", "exec", cid, "bash", "-c", sb.setup_cmd(tree)])
+            if r.returncode != 0:
+                raise SystemExit(f"sandbox setup failed: {r.stdout}{r.stderr}")
+            failure = sb.sh(["docker", "exec", "--user", uid, *sandbox_env(tree), cid, "bash", "-c",
+                             "cvebench-test trigger"], timeout=600).stdout
+            task = sb.bug_report(trig, failure, args.results, args.fl, args.fl_top)
+            instruction = instruction_t.substitute(repo_path=tree, bug_report=task)
+            with open(os.path.join(rdir, "instruction.txt"), "w") as fh:
+                fh.write(instruction)
+
+            # the agent's terminal: an interactive bash inside the sandbox, as the invoking user
+            shell = os.path.join(rdir, "sandbox-shell.sh")
+            with open(shell, "w") as fh:
+                fh.write("#!/usr/bin/env bash\n# OpenHands terminal backend: interactive bash in the cvebench sandbox\n"
+                         "# (a wide PTY, so long commands are not wrapped and their echo can be stripped)\n"
+                         "stty cols 4096 rows 60 2>/dev/null\n"
+                         f"exec docker exec -i -t --user {uid} {' '.join(sandbox_env(tree))} -w {tree} {cid} bash \"$@\"\n")
+            os.chmod(shell, 0o755)
+
+            if replay:
+                from openhands.sdk.llm import Message, MessageToolCall, TextContent
+                from openhands.sdk.testing import TestLLM
+                calls = replay + [{"tool": "finish", "args": {"message": "replay done"}}]
+                llm = TestLLM.from_messages([
+                    Message(role="assistant", content=[TextContent(text="replay")],
+                            tool_calls=[MessageToolCall(id=f"call_{i}", name=c["tool"], origin="completion",
+                                                        arguments=json.dumps({"security_risk": "LOW", **c["args"]})
+                                                        .replace("$TREE", tree))])
+                    for i, c in enumerate(calls)])
+            else:
+                llm = LLM(model=model_name, usage_id="agent", api_key=SecretStr(api_key) if api_key else None,
+                          base_url=args.base_url if args.base_url and model_name.startswith("openai/") else None,
+                          temperature=args.temperature, native_tool_calling=not args.no_native_tools,
+                          timeout=args.llm_timeout, drop_params=True)
+            condenser = None
+            if not (args.no_condenser or replay):  # OpenHands' SWE-bench defaults: max_size 240, keep_first 2
+                condenser = LLMSummarizingCondenser(llm=llm.model_copy(update={"usage_id": "condenser"}),
+                                                    max_size=240, keep_first=2)
+            agent = Agent(llm=llm, condenser=condenser, system_prompt_kwargs={"cli_mode": True}, tools=[
+                Tool(name=TerminalTool.name, params={"terminal_type": "subprocess", "shell_path": shell}),
+                Tool(name=FileEditorTool.name),
+                Tool(name=TaskTrackerTool.name)])
+
+            def on_event(e):
+                nonlocal steps
+                if isinstance(e, ActionEvent):
+                    steps += 1
+                    a = e.action
+                    what = getattr(a, "command", None) or getattr(a, "message", None) or ""
+                    if getattr(a, "path", None):
+                        what = f"{what} {a.path}"
+                    print(f"[openhands] {rid} step {steps}: {e.tool_name}: {str(what)[:150]!r}", flush=True)
+
+            conv = Conversation(agent=agent, workspace=tree, persistence_dir=os.path.join(rdir, "conversation"),
+                                callbacks=[on_event], max_iteration_per_run=args.max_iterations,
+                                visualizer=None, delete_on_close=False)
+            timer = threading.Timer(args.time_limit, conv.pause)
+            timer.daemon = True
+            print(f"[openhands] {bug.name} {rid}: agent start ({model_name}, "
+                  f"≤{args.max_iterations} steps, ≤{args.time_limit}s)", flush=True)
+            timer.start()
+            try:
+                conv.send_message(instruction)
+                fake = 0
+                while True:  # benchmarks/utils/fake_user_response.py: run_conversation_with_fake_user_response
+                    conv.run()
+                    st = conv.state.execution_status
+                    events = list(conv.state.events)
+                    if st != ConversationExecutionStatus.FINISHED:
+                        break
+                    last = next((e for e in reversed(events) if isinstance(e, (ActionEvent, MessageEvent))
+                                 and getattr(e, "source", "agent") == "agent"), None)
+                    if not isinstance(last, MessageEvent) or fake >= 10:
+                        break  # finished with the finish tool (or nothing left to answer)
+                    n_user = sum(1 for e in events if isinstance(e, MessageEvent) and e.source == "user")
+                    conv.send_message(FAKE_USER + (FAKE_USER_GIVE_UP if n_user >= 2 else ""))
+                    fake += 1
+                st = conv.state.execution_status
+                finished = any(isinstance(e, ActionEvent) and isinstance(e.action, FinishAction)
+                               for e in conv.state.events)
+                err = next((e for e in reversed(conv.state.events) if type(e).__name__ == "ConversationErrorEvent"), None)
+                status = ("finished" if finished else
+                          "time_limit" if time.time() - t0 >= args.time_limit else
+                          "max_iterations" if err is not None and err.code == "MaxIterationsReached" else
+                          f"{st.value}: {err.code}: {err.detail}" if err is not None else st.value)
+            except Exception as e:  # model/server errors end the run; the edits so far are still exported
+                status = f"error: {type(e).__name__}: {e}"
+            finally:
+                timer.cancel()
+                try:
+                    events = [e.model_dump(mode="json") for e in conv.state.events]
+                    with open(traj, "w") as fh:
+                        json.dump({"model": model_name, "status": status, "events": events}, fh, indent=1)
+                    cost = float(getattr(llm.metrics, "accumulated_cost", 0.0) or 0.0)
+                except Exception as e:
+                    print(f"[openhands] {rid}: could not save the trajectory: {e}", flush=True)
+                conv.close()
+            files, diff = sb.export_patch(cid, tree, args.workdir, cand)
+        finally:
+            if cid:
+                subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
+            shutil.rmtree(tmp, ignore_errors=True)
+        n = sb.patch_lines(diff)
+        summary[rid] = {"exit_status": status, "steps": steps, "seconds": int(time.time() - t0), "cost": cost,
+                        "model": model_name, "native_tools": not args.no_native_tools, "fl": args.fl,
+                        "changed_files": files, "patch_lines": n, "candidate": f"candidates/{rid}.patch" if n else None}
+        json.dump(summary, open(summary_p, "w"), indent=2)
+        print(f"[openhands] {rid}: {status}, {steps} steps, {summary[rid]['seconds']}s, "
+              f"changed {files or 'nothing'} -> " + (f"candidates/{rid}.patch ({n} lines)" if n else "no candidate"),
+              flush=True)
+
+
+if __name__ == "__main__":
+    main()
