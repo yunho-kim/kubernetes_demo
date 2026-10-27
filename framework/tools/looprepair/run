@@ -21,6 +21,9 @@ What is LoopRepair's and what is cvebench's
     re-analyse the first 20 evaluated, compiling, test-failing candidates, drop those whose
     bug type changed, rank by trace length ("impact lines"), take the top 2 as bases, and
     generate from each base's top-2 locations — for at most 3 iterations / 180 minutes.
+    The 180 minutes (--iterative-minutes) bound the whole run: they are checked before every
+    iteration, base and evaluated candidate, no LLM call starts after them, and a call in
+    flight times out at them (generating from one base can take hours with a slow model).
   * Replaced (CrashRepair's KLEE/taint analyzer needs a crashing input; HAProxy's CVEs are
     logic bugs exposed by a failing vtest, so there is no crash to analyse):
       initial fix localization -> the top --fl-top lines of a cvebench FL ranking
@@ -214,15 +217,25 @@ class Tree:
         return "".join(l if l.endswith("\n") else l + "\n\\ No newline at end of file\n" for l in out)
 
 
+class DeadlineReached(Exception):
+    """The run's --iterative-minutes budget is spent: no further LLM call is made."""
+
+
 class LLM:
     """OpenAI-compatible client handed to upstream (LLMRepair.client): retries, logs every
-    exchange, and falls back from JSON-schema output when the server rejects it."""
+    exchange, and falls back from JSON-schema output when the server rejects it.
+
+    It also enforces the run's time budget (deadline, set by main): after it no call is
+    started — DeadlineReached, which upstream's patch_generation turns into "no candidate"
+    like any failed call — and a call in flight times out at it."""
 
     def __init__(self, out_dir, model, base_url, api_key, temperature, json_schema, replay):
         self.dir = os.path.join(out_dir, "llm")
         os.makedirs(self.dir, exist_ok=True)
         self.n = len(os.listdir(self.dir))
         self.model, self.temperature, self.json_schema, self.replay = model, temperature, json_schema, replay
+        self.deadline = None
+        self.skipped = 0
         self.real = None
         if not replay:
             import openai
@@ -241,7 +254,15 @@ class LLM:
         lines.insert(at + 1, "\t/* looprepair replay */")
         return json.dumps({"patch_function": "\n".join(lines), "explanation": "replay"})
 
+    def left(self):
+        return float("inf") if self.deadline is None else self.deadline - time.time()
+
     def create(self, **kw):
+        if self.left() <= 0:
+            if not self.skipped:
+                log("time limit reached: skipping the remaining LLM calls")
+            self.skipped += 1
+            raise DeadlineReached("time limit reached")
         kw = dict(kw)
         kw["model"] = self.model
         if self.temperature is not None:
@@ -254,7 +275,9 @@ class LLM:
                 return types.SimpleNamespace(choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=content))])
             last = None
             for attempt in range(4):
-                send = dict(kw)
+                if attempt and self.left() <= 0:
+                    raise DeadlineReached(f"time limit reached while retrying ({type(last).__name__})")
+                send = dict(kw, timeout=min(3600, self.left()))
                 if not self.json_schema and "response_format" in send:
                     schema = send.pop("response_format")["json_schema"]["schema"]
                     send["messages"] = send["messages"] + [{
@@ -275,7 +298,7 @@ class LLM:
                 except (self.openai.APIConnectionError, self.openai.APITimeoutError,
                         self.openai.RateLimitError, self.openai.InternalServerError) as e:
                     last = e
-                    time.sleep(10 * (attempt + 1))
+                    time.sleep(max(0, min(10 * (attempt + 1), self.left())))
             raise last
         except Exception as e:
             rec["error"] = f"{type(e).__name__}: {e}"
@@ -310,9 +333,9 @@ def line_map(old, new):
 
 
 class LoopRepair:
-    def __init__(self, args, bug, L, tree, box, out_dir):
+    def __init__(self, args, bug, L, tree, box, out_dir, deadline):
         self.args, self.bug, self.L, self.tree, self.box, self.out = args, bug, L, tree, box, out_dir
-        self.t0 = time.time()
+        self.deadline = deadline  # the whole run's --iterative-minutes budget (shared with the LLM client)
         self.stash = []           # (file path, patched file text | None), in upstream's candidate order
         self.n_cand = 0
         self.found = []
@@ -342,14 +365,15 @@ class LoopRepair:
             try:
                 return up_predict(function=function, number=number, line=line)
             except Exception as e:  # upstream does not catch here; one failed call would abort the round
-                log(f"sequence prediction failed ({type(e).__name__}); continuing without a sequence")
+                if not isinstance(e, DeadlineReached):
+                    log(f"sequence prediction failed ({type(e).__name__}); continuing without a sequence")
                 return ""
 
         L.generate_candidates = generate_candidates
         L.Predict_sequence = predict_sequence
 
     def left(self):
-        return self.args.iterative_minutes * 60 - (time.time() - self.t0)
+        return self.deadline - time.time()
 
     # ---- generation (upstream LLMRepair) -> candidates as overlays
     def generate(self, locations, base, iteration):
@@ -496,6 +520,9 @@ class LoopRepair:
                 return False
             nxt = list(pool)
             for base in pool:
+                if self.left() <= 0:  # checked per base: generating from one can take hours
+                    log("iterative time limit reached")
+                    return False
                 log(f"iteration {iteration + 1}: base {base['id']} (trace {int(base['impact_lines'])} lines), "
                     f"locations {[l['location'].split(self.tree.root + '/')[-1] for l in base['localization_result'][:2]]}")
                 cands = self.generate(base["localization_result"][:2], base, iteration + 1)
@@ -551,7 +578,7 @@ def main():
                     help="the server does not support response_format json_schema")
     ap.add_argument("--max-iterations", type=int, default=3)
     ap.add_argument("--validation-minutes", type=int, default=45, help="per validation round (upstream default)")
-    ap.add_argument("--iterative-minutes", type=int, default=180, help="whole run (upstream iterative limit)")
+    ap.add_argument("--iterative-minutes", type=int, default=180, help="whole run, LLM calls included (upstream iterative limit)")
     ap.add_argument("--test-timeout", type=int, default=60)
     ap.add_argument("--patch-limit", type=int, default=10)
     ap.add_argument("--no-stop-early", action="store_true")
@@ -562,13 +589,13 @@ def main():
         raise SystemExit(f"looprepair not prepared — run {HERE}/prepare.sh (cvebench prepare -t looprepair)")
     if os.path.realpath(sys.prefix) != os.path.realpath(VENV):  # re-exec inside the venv
         os.execv(os.path.join(VENV, "bin", "python"), [os.path.join(VENV, "bin", "python"), os.path.abspath(__file__)] + sys.argv[1:])
-    args.results = os.path.abspath(args.results)
+    args.results, args.workdir = os.path.abspath(args.results), os.path.abspath(args.workdir)  # before chdir below
     if not os.path.exists(os.path.join(args.results, "tests.json")):
         raise SystemExit("no coverage for this bug — run `cvebench coverage` first (re-localization uses it)")
 
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(os.path.join(out_dir, "work"), exist_ok=True)
-    bug = sb.Bug(os.path.abspath(args.workdir))
+    bug = sb.Bug(args.workdir)
     bug.ensure_image("looprepair")
     model = "replay" if args.replay else args.model or (
         sb.default_model(args.base_url, prefix="") if args.base_url else "gpt-4o-mini")
@@ -585,22 +612,25 @@ def main():
                    not args.no_json_schema, args.replay)
     L.api_model = model
 
-    tree = Tree(os.path.abspath(args.workdir), os.path.join(out_dir, "work"))
+    tree = Tree(args.workdir, os.path.join(out_dir, "work"))
     box = Sandbox(bug, os.path.join(out_dir, "sandbox"), tree, args.iterative_minutes * 60)
     log(f"{bug.name}: model {model}, fl {args.fl} top {args.fl_top}, ≤{args.max_iterations} iterations, "
         f"≤{args.iterative_minutes} min")
     t0 = time.time()
+    deadline = t0 + args.iterative_minutes * 60
+    L.client.deadline = deadline
     status = "error"
     lr = None
     try:
-        lr = LoopRepair(args, bug, L, tree, box, out_dir)
+        lr = LoopRepair(args, bug, L, tree, box, out_dir, deadline)
         status = "patch found" if lr.run() else "no patch"
     finally:
         box.close()
         summary = {"status": status, "seconds": int(time.time() - t0), "model": model, "fl": args.fl,
                    "fl_top": args.fl_top, "max_iterations": args.max_iterations,
                    "candidates_generated": lr.n_cand if lr else 0, "candidates_evaluated": lr.evaluated if lr else 0,
-                   "llm_calls": L.client.n, "acceptable": lr.found if lr else [],
+                   "llm_calls": L.client.n, "llm_calls_skipped": L.client.skipped,
+                   "time_limit_reached": time.time() >= deadline, "acceptable": lr.found if lr else [],
                    "trigger_signature": getattr(lr, "orig_sig", None)}
         json.dump(summary, open(os.path.join(out_dir, "looprepair.json"), "w"), indent=2)
         log(f"{status}: {summary['candidates_generated']} generated, {summary['candidates_evaluated']} evaluated, "
