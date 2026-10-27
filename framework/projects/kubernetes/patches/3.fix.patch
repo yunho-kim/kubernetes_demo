@@ -1,0 +1,21 @@
+From 36b3f76032143aff8d04e60eb92caf0e3b447eb9
+Subject: do not allow the node to update it's owner reference
+Upstream: https://github.com/kubernetes/kubernetes/pull/133468 (release-1.33; kube-apiserver v1.33.4)
+Source changes only: the test changes of the same commit (plugin/pkg/admission/noderestriction/admission_test.go) stay in both variants.
+---
+diff --git a/plugin/pkg/admission/noderestriction/admission.go b/plugin/pkg/admission/noderestriction/admission.go
+index b85989dbd28c1..b841c853251e8 100644
+--- a/plugin/pkg/admission/noderestriction/admission.go
++++ b/plugin/pkg/admission/noderestriction/admission.go
+@@ -536,6 +536,11 @@ func (p *Plugin) admitNode(nodeName string, a admission.Attributes) error {
+ 			return admission.NewForbidden(a, fmt.Errorf("node %q is not allowed to modify taints", nodeName))
+ 		}
+ 
++		// Don't allow a node to update its own ownerReferences.
++		if !apiequality.Semantic.DeepEqual(node.OwnerReferences, oldNode.OwnerReferences) {
++			return admission.NewForbidden(a, fmt.Errorf("node %q is not allowed to modify ownerReferences", nodeName))
++		}
++
+ 		// Don't allow a node to update labels outside the allowed set.
+ 		// This would allow a node to add or modify its labels in a way that would let it steer privileged workloads to itself.
+ 		modifiedLabels := getModifiedLabels(node.Labels, oldNode.Labels)

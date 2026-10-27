@@ -27,18 +27,19 @@ ranking.json schema
 """
 import json
 import os
+import re
 from collections import defaultdict
 
 
 # ---------------------------------------------------------------- paths
 def norm(p):
-    """Normalise a coverage path to a src-relative one (src/h1.c)."""
+    """Normalise a coverage path to a src-relative one (src/h1.c, pkg/kubelet/server/server.go)."""
     p = p.replace("\\", "/")
     for marker in ("/build/", "./"):
         if p.startswith(marker):
             p = p[len(marker):]
     parts = p.split("/")
-    if parts and parts[0].startswith("haproxy-"):     # strip haproxy-x.y.z/
+    if parts and re.fullmatch(r"[A-Za-z][\w]*-\d+(\.\d+)+", parts[0]):   # strip <project>-x.y.z/
         parts = parts[1:]
     return "/".join(parts)
 

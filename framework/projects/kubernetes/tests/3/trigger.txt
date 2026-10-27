@@ -1,0 +1,4 @@
+# declared trigger tests (cvebench test): the upstream regression subtests added by the fix
+plugin/pkg/admission/noderestriction::Test_nodePlugin_Admit/forbid_update_of_my_node:_add_owner_reference
+plugin/pkg/admission/noderestriction::Test_nodePlugin_Admit/forbid_update_of_my_node:_remove_owner_reference
+plugin/pkg/admission/noderestriction::Test_nodePlugin_Admit/forbid_update_of_my_node:_change_owner_reference

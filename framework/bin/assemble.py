@@ -25,11 +25,12 @@ def outcomes(path):
     return d
 
 
-def covered(tid):
-    p = os.path.join(R, "buggy", "coverage", f"{tid}.json")
-    if not os.path.exists(p):
-        return None
-    return json.load(open(p))["covered"]
+# per-test coverage files, indexed by their "test" field: a test id need not be a
+# file name (Go ids are "<pkg>::<Test>/<subtest>")
+COVFILES = {}
+for fn in sorted(os.listdir(os.path.join(R, "buggy", "coverage"))) if os.path.isdir(os.path.join(R, "buggy", "coverage")) else []:
+    if fn.endswith(".json"):
+        COVFILES[json.load(open(os.path.join(R, "buggy", "coverage", fn)))["test"]] = f"buggy/coverage/{fn}"
 
 
 bug = outcomes(os.path.join(R, "buggy/outcomes.txt"))
@@ -38,12 +39,12 @@ fix = outcomes(os.path.join(R, "fixed/outcomes.txt"))
 tests, triggers, passing, excluded = [], [], [], []
 for tid, boc in bug.items():
     foc = fix.get(tid, "?")
-    cov = covered(tid)
+    cov = COVFILES.get(tid)
     if boc == "fail" and foc == "pass" and cov is not None:
-        tests.append({"name": tid, "outcome": "fail", "coverage": f"buggy/coverage/{tid}.json"})
+        tests.append({"name": tid, "outcome": "fail", "coverage": cov})
         triggers.append(tid)
     elif boc == "pass" and foc == "pass" and cov is not None:
-        tests.append({"name": tid, "outcome": "pass", "coverage": f"buggy/coverage/{tid}.json"})
+        tests.append({"name": tid, "outcome": "pass", "coverage": cov})
         passing.append(tid)
     else:
         excluded.append({"test": tid, "buggy": boc, "fixed": foc})
@@ -68,7 +69,8 @@ with open(os.path.join(gz, "spectra"), "w") as fh:
 with open(os.path.join(gz, "tests"), "w") as fh:
     fh.write("name,outcome,runtime,stacktrace\n")
     for t in tests:
-        fh.write(f"{t['name']},{'PASS' if t['outcome']=='pass' else 'FAIL'},0,\n")
+        name = t["name"].replace(",", ";")              # the GZoltar tests file is comma-separated
+        fh.write(f"{name},{'PASS' if t['outcome']=='pass' else 'FAIL'},0,\n")
 with open(os.path.join(gz, "matrix"), "w") as fh:        # GZoltar matrix: bits + +/-
     for t in tests:
         row = ["0"] * len(comp)
@@ -95,11 +97,15 @@ covered_pairs = set(comp)
 
 resolved, dropped, seen = [], [], set()
 for l in raw_gt.get("lines", []):
-    f, ln = l["file"], int(l["line"])
+    f, ln, side = l["file"], int(l["line"]), l.get("side")
     if (f, ln) in covered_pairs:
         tgt = ln
     else:
-        cands = sorted(cov_by_file.get(f, []), key=lambda x: (abs(x - ln), x))
+        # an omission's bracket lines snap away from the insertion point (to the
+        # executable statement on their side of the missing code)
+        cands = [x for x in cov_by_file.get(f, [])
+                 if side is None or (x < ln if side == "before" else x > ln)]
+        cands = sorted(cands, key=lambda x: (abs(x - ln), x))
         tgt = cands[0] if cands and abs(cands[0] - ln) <= SNAP_WINDOW else None
     if tgt is None:
         dropped.append({"file": f, "line": ln}); continue

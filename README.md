@@ -1,7 +1,7 @@
-# cvebench — a Defects4J-style CVE benchmark (HAProxy)
+# cvebench — a Defects4J-style CVE benchmark (HAProxy, Kubernetes)
 
 A reproducible benchmark of real CVEs, organized like **[Defects4J](https://github.com/rjust/defects4j)**
-but targeting **C / HAProxy** instead of Java. A *project* is the software under
+but targeting **C / HAProxy** and **Go / Kubernetes** instead of Java. A *project* is the software under
 test; a *bug* is a CVE. Reproducing a CVE is just **running its trigger test**,
 and fault-localization / automated-program-repair techniques apply on top of the
 same `checkout → compile → test → coverage` contract — exactly as researchers use
@@ -11,11 +11,12 @@ Defects4J.
 
 | Defects4J | cvebench |
 | --- | --- |
-| project (Lang, Chart, …) | `haproxy` (under `framework/projects/`) |
-| bug `<PID>-<bid>` (Lang-1) | `haproxy-1`, `haproxy-2`, `haproxy-3` (a CVE each) |
+| project (Lang, Chart, …) | `haproxy`, `kubernetes` (under `framework/projects/`) |
+| `framework/core/Project/<Name>.pm` | `framework/projects/<pid>/project.sh` (fetch, build, test hooks) |
+| bug `<PID>-<bid>` (Lang-1) | `haproxy-1..3`, `kubernetes-1..3` (a CVE each) |
 | `commit-db` maps bid → revisions | `commit-db` maps bid → CVE, fixed release, fix commit, CWE, CVSS |
 | minimal buggy↔fixed pair | **buggy = fixed release with `patches/<bid>.fix.patch` reverse-applied** |
-| project's own test suite | HAProxy's `reg-tests/` run via `vtest` |
+| project's own test suite | HAProxy's `reg-tests/` run via `vtest`; Kubernetes' Go tests, one leaf test (`<pkg>::<Test>/<subtest>`) at a time |
 | trigger tests expose the bug | `trigger_tests/<bid>` — *fail on buggy, pass on fixed* (= the CVE reproduction) |
 | `checkout / compile / test / coverage` | same verbs (`framework/bin/cvebench`) |
 | `modified_classes`, `relevant_tests`, `loaded_classes` | same per-bug metadata files |
@@ -26,7 +27,7 @@ Defects4J.
 framework/
 ├── bin/
 │   ├── cvebench              # the CLI
-│   ├── cvebench-coverage     # per-test coverage collector (kind + vtest)
+│   ├── cvebench-coverage     # per-test coverage + classification (suite run by the project module)
 │   ├── gtdiff.py             # buggy↔fixed diff → exact line-level ground truth
 │   ├── assemble.py           # classify suite → GZoltar spectra/matrix/tests
 │   └── sbfl-rank             # built-in SBFL: Ochiai/Tarantula/Jaccard/D*/Op2/Barinel/GP13/Kulczynski2/Ample + EXAM
@@ -42,28 +43,38 @@ framework/
 │   ├── darjeeling/           # Darjeeling: GenProg-style search-based repair (Kaskara/clang statement edits)
 │   ├── looprepair/           # LoopRepair (ICSE 2026): location-aware, trace-guided iterative LLM repair
 │   └── oracle/               # reference APR adapter (upstream fix + empty patch)
-└── projects/haproxy/
-    ├── commit-db             # bid,cve,fixed_version,fix_commit,cwe,cvss,summary
-    ├── patches/<bid>.fix.patch
-    ├── tests/<bid>/          # trigger.vtc, regtests.txt, build.env
-    ├── build/                # Dockerfile.minpair, cov-flush-wrapper.sh, runsuite.sh
-    ├── trigger_tests/<bid>  relevant_tests/<bid>  modified_classes/<bid>  loaded_classes/<bid>
+├── projects/haproxy/
+│   ├── project.sh            # project module: tarball fetch, gcov build, vtest runners, kind coverage
+│   ├── commit-db             # bid,cve,fixed_version,fix_commit,cwe,cvss,summary
+│   ├── patches/<bid>.fix.patch
+│   ├── tests/<bid>/          # trigger.vtc, regtests.txt, build.env
+│   ├── build/                # Dockerfile.minpair, cov-flush-wrapper.sh, runsuite.sh
+│   └── trigger_tests/<bid>  relevant_tests/<bid>  modified_classes/<bid>  loaded_classes/<bid>
+└── projects/kubernetes/
+    ├── project.sh            # project module: GitHub tag archive, Go build, gosuite runners
+    ├── commit-db
+    ├── patches/<bid>.fix.patch   # source changes only; the fix's test changes stay in both variants
+    ├── tests/<bid>/          # packages.txt, coverpkg.txt, trigger.txt, build.env, overlay/ (crafted triggers)
+    ├── build/                # Dockerfile.minpair, gosuite.py (leaf-test runner + coverage), cover-on-panic.py
+    └── trigger_tests/<bid>  relevant_tests/<bid>  modified_classes/<bid>  loaded_classes/<bid>
 bin/                          # vendored kind + kubectl
 ```
 
 ## Prerequisites
 
 Docker (running, user in the `docker` group). `kind` and `kubectl` are vendored
-in `./bin/`. Coverage builds compile HAProxy from source and run its `reg-tests`
-under `vtest` inside a `kind` pod.
+in `./bin/`. HAProxy coverage builds compile HAProxy from source and run its
+`reg-tests` under `vtest` inside a `kind` pod. Kubernetes images build the
+release on `golang:<ver>` (vendored dependencies, tests run offline) and run Go
+tests in throwaway containers; an image is ~2.8 GB and builds in about a minute.
 
 ## CLI
 
 ```bash
 cvebench=framework/bin/cvebench
 
-$cvebench pids                                   # haproxy
-$cvebench bids   -p haproxy                      # 1 2 3
+$cvebench pids                                   # haproxy kubernetes
+$cvebench bids   -p kubernetes                   # 1 2 3
 $cvebench info   -p haproxy -b 3                 # metadata + result
 $cvebench export -p haproxy -b 3 -q fix_commit
 ```
@@ -72,6 +83,8 @@ $cvebench export -p haproxy -b 3 -q fix_commit
 ```bash
 $cvebench compile -p haproxy -b 3                # build buggy+fixed coverage images
 $cvebench test    -p haproxy -b 3                # buggy: trigger FAILS (reproduced); fixed: PASSES
+$cvebench compile -p kubernetes -b 1             # same verbs for every project
+$cvebench test    -p kubernetes -b 1
 ```
 
 ### Fault localization
@@ -135,6 +148,16 @@ validation semantics, portability rules) is specified in
 | haproxy-1 | CVE-2021-40346 | CWE-190 | 8.6 | 2.4.4 | `include/haproxy/htx.h` |
 | haproxy-2 | CVE-2022-0711 | CWE-835 | 7.5 | 2.4.13 | `src/http_ana.c` |
 | haproxy-3 | CVE-2023-45539 | CWE-436 | 8.2 | 2.8.2 | `src/h1.c` |
+| kubernetes-1 | CVE-2024-10220 | CWE-22 | 8.1 | 1.30.3 | `pkg/volume/git_repo/git_repo.go` (kubelet) |
+| kubernetes-2 | CVE-2025-0426 | CWE-400 | 6.2 | 1.32.2 | `pkg/kubelet/server/server.go` (kubelet) |
+| kubernetes-3 | CVE-2025-5187 | CWE-863 | 6.7 | 1.33.4 | `plugin/pkg/admission/noderestriction/admission.go` (kube-apiserver) |
+
+The Kubernetes bugs are the highest-CVSS CVEs of the core components
+(`kubernetes/kubernetes`) fixed in the last three years that reproduce on Linux:
+Windows-only CVEs, subprojects (ingress-nginx, CSI drivers, image-builder) and
+CVEs without a fix were left out. Triggers are the upstream regression tests of
+the fix (kubernetes-1, -3) or a crafted Go test (kubernetes-2, whose fix shipped
+without one).
 
 ## Fault-localization results (Ochiai, line-level)
 
@@ -143,6 +166,9 @@ validation semantics, portability rules) is specified in
 | haproxy-2 | 1 / 19 | 19716 | 1–86 | 0.0000 | easy — the loop is entered only by the trigger |
 | haproxy-3 | 2 / 36 | 27188 | 673–719 | 0.0247 | medium — missing `#` check |
 | haproxy-1 | 1 / 19 | 19465 | 3405–8049 | 0.1749 | hard — overflow on an always-executed line |
+| kubernetes-3 | 3 / 210 | 511 | 3–4 | 0.0039 | easy — missing ownerReferences check, three focused subtests |
+| kubernetes-1 | 1 / 35 | 670 | 1–158 | 0.0000 | tie — the one failing test is the only one that sets up a gitRepo volume |
+| kubernetes-2 | 1 / 478 | 1186 | 106–217 | 0.0885 | medium — a route registered in the wrong handler set; every test runs it |
 
 `results/` (per-test coverage, GZoltar `spectra`/`matrix`/`tests`, rankings) is
 generated by `cvebench coverage` and git-ignored; the benchmark *definition*
@@ -150,17 +176,28 @@ generated by `cvebench coverage` and git-ignored; the benchmark *definition*
 
 ## How it works
 
-- **Minimal pair** — `cvebench compile` builds the fixed release from source with
-  `gcc --coverage`; the buggy image reverse-applies the fix patch. Only the fix differs.
+- **Minimal pair** — `cvebench compile` builds the fixed release from source (HAProxy
+  with `gcc --coverage`; Kubernetes with its pinned Go toolchain, build cache warmed
+  on the fixed source); the buggy image reverse-applies the fix patch. Only the fix differs.
 - **Ground truth** — the buggy↔fixed source `diff`, snapped to the nearest executable
   (covered) line; handles faults of omission.
 - **Coverage flush** — HAProxy is wrapped so a `gdb __gcov_dump()` fires on stop (and
   periodically for the CVE-2022-0711 infinite loop, which the watchdog would otherwise
-  abort before flushing).
+  abort before flushing). In the Kubernetes images Go's `testing` package writes the
+  coverage profile before re-panicking, so a buggy version that panics (kubernetes-1)
+  keeps its failing test's coverage.
 - **Classification** — each reg-test runs on both buggy and fixed; *fail-on-buggy ∧
   pass-on-fixed* ⇒ trigger, *pass-on-both* ⇒ passing test, else excluded.
 
 ## Adding a bug
 
-Add a `commit-db` row, drop the upstream fix at `patches/<bid>.fix.patch`, add
-`tests/<bid>/trigger.vtc` (+ `regtests.txt`), then `cvebench compile/coverage`.
+Add a `commit-db` row, drop the upstream fix at `patches/<bid>.fix.patch`, add the
+bug's `tests/<bid>/` (haproxy: `trigger.vtc` + `regtests.txt`; kubernetes:
+`trigger.txt`, `packages.txt`, `coverpkg.txt`, `build.env`, optional `overlay/`),
+then `cvebench compile/test/coverage`. A new project adds `framework/projects/<pid>/`
+with a `project.sh` module (hooks documented in `framework/lib/cvebench.sh`).
+
+The external tools `flitsr` (spectrum only) and `oracle` work on every project; the
+others under `framework/tools/` are still HAProxy-specific (vtest, gcov, `make`, C
+parsers). On the Kubernetes bugs the core harness (`checkout … validate`,
+`coverage`, built-in SBFL, `fl -t flitsr`, `apr -t oracle`) works today.

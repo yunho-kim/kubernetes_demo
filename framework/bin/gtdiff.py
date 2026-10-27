@@ -7,7 +7,9 @@ hand-authored anchors and matches gcov's line numbers in the buggy build.
 
 - replace/delete hunks -> the buggy lines themselves are faulty
 - insert hunks (fault of omission, e.g. a missing check) -> the buggy lines
-  bracketing the insertion point are the candidates
+  bracketing the insertion point are the candidates, tagged "side": "before" /
+  "after" so assemble.py snaps them backward / forward to the executable
+  statement on that side of the missing code
 """
 import sys, json, difflib
 
@@ -15,21 +17,21 @@ buggy, fixed, rel = sys.argv[1], sys.argv[2], sys.argv[3]
 b = open(buggy, errors="replace").read().splitlines()
 f = open(fixed, errors="replace").read().splitlines()
 
-lines = set()
+lines = {}          # buggy line -> side (None = a changed line itself)
 omission = False
 for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=b, b=f, autojunk=False).get_opcodes():
     if tag in ("replace", "delete"):
         for ln in range(i1 + 1, i2 + 1):       # 0-based -> 1-based buggy line numbers
-            lines.add(ln)
+            lines[ln] = None
     elif tag == "insert":
         omission = True
         if i1 >= 1:
-            lines.add(i1)                       # line before the insertion
+            lines.setdefault(i1, "before")      # line before the insertion
         if i1 + 1 <= len(b):
-            lines.add(i1 + 1)                   # line after the insertion
+            lines.setdefault(i1 + 1, "after")   # line after the insertion
 
 json.dump({
     "files": [rel],
-    "lines": [{"file": rel, "line": ln} for ln in sorted(lines)],
+    "lines": [dict({"file": rel, "line": ln}, **({"side": s} if s else {})) for ln, s in sorted(lines.items())],
     "fault_of_omission": omission,
 }, sys.stdout)
