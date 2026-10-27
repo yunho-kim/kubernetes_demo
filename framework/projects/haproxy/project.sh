@@ -4,7 +4,9 @@
 # globs) plus the crafted tests/<bid>/trigger.vtc. Coverage runs in kind pods.
 # shellcheck shell=bash
 
-P_DIFF_EXCLUDES=('*.o' '*.d' '*.a' '*.so' haproxy '.*')
+# (not `haproxy`: diff -x matches basenames, which would also drop include/haproxy/;
+# the built binary shows up as a "Binary files" line, which cvebench diff drops)
+P_DIFF_EXCLUDES=('*.o' '*.d' '*.a' '*.so' '.*')
 
 p_srcname() { printf 'haproxy-%s' "$1"; }
 

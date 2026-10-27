@@ -154,7 +154,7 @@ cmd_diff() { need WD   # edits in a checkout vs the pristine version -> unified 
   [[ "$var" == buggy ]] && ( cd "$tmp/pristine/$s" && patch -R -p1 < "$(proj_dir "$pid")/patches/$bid.fix.patch" >/dev/null )
   ln -s "$tmp/pristine/$s" "$tmp/a"; ln -s "$(cd "$WD" && pwd)/$s" "$tmp/b"
   for x in "${P_DIFF_EXCLUDES[@]}"; do xs+=(-x "$x"); done
-  ( cd "$tmp" && diff -ruN "${xs[@]}" a b | grep -v '^diff -ruN ' ) || true
+  ( cd "$tmp" && diff -ruN "${xs[@]}" a b | grep -v -e '^diff -ruN ' -e '^Binary files ' ) || true
   rm -rf "$tmp"
 }
 
