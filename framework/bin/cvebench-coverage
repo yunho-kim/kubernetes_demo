@@ -15,7 +15,10 @@ B="$(bug_image "$PID" "$BID" buggy)"; F="$(bug_image "$PID" "$BID" fixed)"
 R="$RESULTS_ROOT/$PID-$BID"
 
 docker image inspect "$B" "$F" >/dev/null 2>&1 || die "missing images (cvebench compile -p $PID -b $BID)"
-rm -rf "$R"; mkdir -p "$R/buggy" "$R/fixed"
+# start the coverage artifacts afresh; keep apr/ and the other tools' fl/ results (expensive LLM runs)
+rm -rf "$R/buggy" "$R/fixed" "$R/gzoltar" "$R/fl/sbfl" \
+       "$R"/{tests,classification,ground_truth,ground_truth_raw}.json
+mkdir -p "$R/buggy" "$R/fixed"
 MODFILES="$(bug_modified_files "$PID" "$BID")"
 log "$PID-$BID ($(bug_cve "$PID" "$BID"))  fixed=$FIXVER  modified: $(echo $MODFILES | tr '\n' ' ')"
 
