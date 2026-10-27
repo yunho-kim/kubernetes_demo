@@ -97,11 +97,15 @@ covered_pairs = set(comp)
 
 resolved, dropped, seen = [], [], set()
 for l in raw_gt.get("lines", []):
-    f, ln = l["file"], int(l["line"])
+    f, ln, side = l["file"], int(l["line"]), l.get("side")
     if (f, ln) in covered_pairs:
         tgt = ln
     else:
-        cands = sorted(cov_by_file.get(f, []), key=lambda x: (abs(x - ln), x))
+        # an omission's bracket lines snap away from the insertion point (to the
+        # executable statement on their side of the missing code)
+        cands = [x for x in cov_by_file.get(f, [])
+                 if side is None or (x < ln if side == "before" else x > ln)]
+        cands = sorted(cands, key=lambda x: (abs(x - ln), x))
         tgt = cands[0] if cands and abs(cands[0] - ln) <= SNAP_WINDOW else None
     if tgt is None:
         dropped.append({"file": f, "line": ln}); continue
