@@ -2,7 +2,7 @@
 """run — cvebench adapter for AutoFL (Kang, An, Yoo, FSE 2024), ported to C.
 
     run <results-dir> [-o <out-dir>] [--reps 5] [--budget 10] [--num-tests 1]
-        [--model M] [--base-url URL] [--protocol tools|text] [--temperature T] [--fresh]
+        [--model M] [--base-url URL] [--protocol tools|text|cosmos] [--temperature T] [--fresh]
 
 LLM endpoint: any OpenAI-compatible chat API with function/tool calling —
   OPENAI_BASE_URL (or --base-url), OPENAI_API_KEY, AUTOFL_MODEL (or --model).
@@ -65,7 +65,8 @@ def main():
     ap.add_argument("--num-tests", type=int, default=1)
     ap.add_argument("--model", default=None)
     ap.add_argument("--base-url", default=None)
-    ap.add_argument("--protocol", default="tools", choices=("tools", "text"))
+    ap.add_argument("--protocol", default="tools", choices=("tools", "text", "cosmos"),
+                    help="cosmos: COSMosFL's protocol for small models (used by framework/tools/cosmosfl)")
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--fresh", action="store_true", help="discard cached runs")
     ap.add_argument("--no-redact", action="store_true",

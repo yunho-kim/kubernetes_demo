@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""run — cvebench adapter for COSMosFL (Cho, Kang, An, Yoo, LLM4Code 2025), ported to C.
+
+    run <results-dir> [-o <out-dir>] [--models llama3,llama3.1,mistral-nemo,qwen2.5-coder]
+        [--base-url URL] [--reps 5] [--weights W1,W2,...] [--budget 10] [--temperature T]
+        [--no-redact] [--fresh]
+
+COSMosFL is an ensemble of small language models (SLMs) instantiated with AutoFL:
+  1. every member model runs AutoFL R_m times. Small models get COSMosFL's protocol: the
+     functions are described in the prompt, the conversation is flattened into one prompt and
+     "Function call:" lines are parsed (framework/tools/autofl/run --protocol cosmos);
+  2. each run spreads a vote of 1 over the functions it names; a member's score of a function
+     is its vote total divided by the number of runs of the whole ensemble;
+  3. the ensemble score is the weighted sum of the member scores, the weights normalised to
+     sum to the number of members (upstream compute_weighted_score.py). Equal weights are the
+     default; the paper also learns them by differential evolution over training bugs, which
+     did not beat equal weights — pass learned ones with --weights;
+  4. ties are broken as in AutoFL: failing tests covering the function, how often runs
+     inspected it (only for functions no member voted for), first appearance, then name.
+Defaults follow the paper's final ensemble — Llama3 8B, Llama3.1 8B, Mistral NeMo 12B,
+Qwen2.5-Coder 7B (4-bit, served by Ollama) — and R_m = 5 (R = 20); see versions.env.
+
+Models: a name, or name@base-url for a member served elsewhere. The default endpoint is
+Ollama's OpenAI-compatible API, http://127.0.0.1:11434/v1 (--base-url or COSMOSFL_BASE_URL).
+
+Outputs: <out-dir>/models/<model>/ holds each member's AutoFL runs and its own ranking;
+<out-dir>/ranking.json has the formulas cosmosfl (function ranks expanded to lines) and
+cosmosfl_op2tb (line ties broken by Op2), as for autofl.
+"""
+import argparse
+import collections
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
+import flcommon as fl  # noqa: E402
+
+AUTOFL = os.path.join(FW_ROOT, "tools", "autofl")
+PINS = dict(l.strip().split("=", 1) for l in open(os.path.join(HERE, "versions.env")) if "=" in l and not l.startswith("#"))
+OLLAMA = "http://127.0.0.1:11434/v1"
+
+
+def inspected(run, functions):
+    """Functions a run looked at with get_code_snippet / get_comments (AutoFL's aux score)."""
+    out = collections.Counter()
+    for c in run.get("calls", []):
+        if c["name"] not in ("get_code_snippet", "get_comments"):
+            continue
+        try:
+            q = json.loads(c["arguments"]).get("signature", "")
+        except Exception:
+            q = ""
+        for f in functions:
+            if f["name"] and (q == f["signature"] or q.split("(")[0].split(":")[-1].strip("` ") == f["name"]):
+                out[f["signature"]] += 1
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("results")
+    ap.add_argument("-o", "--out-dir", default=None)
+    ap.add_argument("--models", default=PINS["COSMOSFL_MODELS"], help="comma-separated; name or name@base-url")
+    ap.add_argument("--base-url", default=os.environ.get("COSMOSFL_BASE_URL", OLLAMA))
+    ap.add_argument("--reps", type=int, default=int(PINS["COSMOSFL_REPS"]), help="AutoFL runs per model (R_m)")
+    ap.add_argument("--weights", default=None, help="comma-separated member weights (default: equal)")
+    ap.add_argument("--budget", type=int, default=10)
+    ap.add_argument("--temperature", type=float, default=None)
+    ap.add_argument("--no-redact", action="store_true")
+    ap.add_argument("--fresh", action="store_true", help="discard cached runs")
+    ap.add_argument("--top", type=int, default=15)
+    ap.add_argument("--metric", action="append", default=None, help=argparse.SUPPRESS)
+    args = ap.parse_args()
+
+    if not os.access(os.path.join(AUTOFL, ".venv", "bin", "python"), os.X_OK):
+        raise SystemExit(f"cosmosfl needs the autofl adapter — run {HERE}/prepare.sh (cvebench prepare -t cosmosfl)")
+    models = []
+    for spec in args.models.split(","):
+        name, _, url = spec.strip().partition("@")
+        models.append((name, url or args.base_url))
+    names = [m for m, _ in models]
+    if len(set(names)) != len(names):
+        raise SystemExit("--models: each member must be named once")
+    weights = [float(w) for w in args.weights.split(",")] if args.weights else [1.0] * len(models)
+    if len(weights) != len(models) or min(weights) < 0 or sum(weights) <= 0:
+        raise SystemExit("--weights: one non-negative weight per model, not all zero")
+    weights = [w * len(models) / sum(weights) for w in weights]
+
+    out_dir = args.out_dir or os.path.join(args.results, "fl", "cosmosfl")
+    env = dict(os.environ, OPENAI_API_KEY=os.environ.get("OPENAI_API_KEY") or "none")
+    member = {}
+    for name, url in models:
+        mdir = os.path.join(out_dir, "models", re.sub(r"[^\w.-]", "_", name))
+        os.makedirs(mdir, exist_ok=True)
+        cmd = [os.path.join(AUTOFL, "run"), args.results, "-o", mdir, "--protocol", "cosmos", "--model", name,
+               "--base-url", url, "--reps", str(args.reps), "--budget", str(args.budget)]
+        cmd += ["--fresh"] if args.fresh else []
+        cmd += ["--no-redact"] if args.no_redact else []
+        cmd += ["--temperature", str(args.temperature)] if args.temperature is not None else []
+        print(f"[cosmosfl] {name} @ {url}: {args.reps} AutoFL run(s) -> {mdir}", flush=True)
+        with open(os.path.join(mdir, "autofl.log"), "w") as log:
+            if subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT).returncode != 0:
+                raise SystemExit(f"autofl failed for {name} (see {mdir}/autofl.log)")
+        rdir = os.path.join(mdir, "runs")
+        runs = [json.load(open(os.path.join(rdir, f))) for f in sorted(os.listdir(rdir))]
+        own = json.load(open(os.path.join(mdir, "ranking.json")))["formulas"]["autofl"].get("fault_rank")
+        member[name] = {"dir": mdir, "runs": runs, "fault_rank": own}
+        print(f"[cosmosfl]   {len(runs)} runs, {sum('error' not in r for r in runs)} ok; "
+              f"alone: fault rank {own[0] if own else 'NOT FOUND'}", flush=True)
+
+    # ---- ensemble vote (upstream compute_weighted_score.py, aux scores of compute_score.py)
+    functions = json.load(open(os.path.join(member[names[0]]["dir"], "functions.json")))
+    fmeta = {f["signature"]: f for f in functions}
+    n_all = sum(len(m["runs"]) for m in member.values())
+    score = collections.defaultdict(dict)        # signature -> model -> score
+    first, seen = [], collections.Counter()
+    for name in names:
+        for run in member[name]["runs"]:
+            matched = run.get("matched", {})
+            for sig in matched:
+                score[sig][name] = score[sig].get(name, 0.0) + 1.0 / len(matched) / n_all
+                if sig not in first:
+                    first.append(sig)
+            if "error" not in run:               # upstream counts inspections in OK runs only
+                seen.update(inspected(run, functions))
+    order = first + sorted(s for s in fmeta if s not in score)
+    total = {s: sum(w * score.get(s, {}).get(m, 0.0) for m, w in zip(names, weights)) for s in order}
+    keys = [(-total[s], -fmeta[s]["num_failing_tests"] if s in fmeta else 0, -(0 if s in score else seen[s]), i, s)
+            for i, s in enumerate(order)]
+    ranked = [k[-1] for k in sorted(keys)]
+    frank = {s: r + 1 for r, s in enumerate(ranked)}
+
+    # ---- function ranks -> lines (as the autofl adapter)
+    spectrum, failing, passing = fl.build_spectrum(args.results)
+    P = len(passing)
+    gt = fl.load_ground_truth(args.results)
+    line_rank = {}
+    for s, r in frank.items():
+        f = fmeta.get(s)
+        if f is None:
+            continue
+        for ln in range(f["begin_line"], f["end_line"] + 1):
+            e = (f["file"], ln)
+            if e in spectrum and (e not in line_rank or r < line_rank[e]):
+                line_rank[e] = r
+    bottom = len(ranked) + 1
+    op2 = {e: s[0] - s[1] / (P + 1) for e, s in spectrum.items()}
+    lo, hi = min(op2.values()), max(op2.values()); span = (hi - lo) or 1.0
+    plain = sorted(((e, float(-line_rank.get(e, bottom))) for e in spectrum), key=lambda x: (-x[1], x[0][0], x[0][1]))
+    hyb = sorted(((e, s + 1e-6 * 0.999 * (op2[e] - lo) / span) for e, s in plain), key=lambda x: (-x[1], x[0][0], x[0][1]))
+
+    print(f"# COSMosFL  results={args.results}  members={len(names)}  runs={n_all}  functions={len(functions)}")
+    print(f"#   weights: {dict(zip(names, (round(w, 3) for w in weights)))}")
+    print("#   function ranking (top 10):")
+    for s in ranked[:10]:
+        votes = " ".join(f"{m}={score.get(s, {}).get(m, 0.0):.2f}" for m in names)
+        print(f"#     {frank[s]:>3}. score={total[s]:.3f} [{votes}]  {s}")
+    if gt:
+        gfun = sorted({s for s, f in fmeta.items() if f["file"] in gt["files"] and any(f["begin_line"] <= ln <= f["end_line"] for ff, ln in gt["lines"] if ff == f["file"])})
+        print(f"#   ground-truth lines: {sorted(gt['lines'])}  in functions: {[(g, frank[g]) for g in gfun]}")
+    print()
+
+    def detail(e):
+        r = line_rank.get(e)
+        if r is None:
+            return "(function not covered by failing tests)"
+        s = ranked[r - 1]
+        return f"(fn#{r} {s.split(':')[-1].split('(')[0]} score={total[s]:.3f})"
+    formulas = {"cosmosfl": fl.report("cosmosfl", plain, gt, args.top, detail),
+                "cosmosfl_op2tb": fl.report("cosmosfl_op2tb", hyb, gt, args.top, detail)}
+    members = {m: {"base_url": u, "weight": w, "runs": len(member[m]["runs"]),
+                   "ok_runs": sum("error" not in r for r in member[m]["runs"]), "alone_fault_rank": member[m]["fault_rank"]}
+               for (m, u), w in zip(models, weights)}
+    for f_ in formulas.values():
+        f_["members"] = members
+        f_["runs"] = n_all
+        f_["functions"] = len(functions)
+        f_["function_ranking"] = [{"rank": frank[s], "signature": s, "score": total[s], "per_model": score.get(s, {})}
+                                  for s in ranked[:50]]
+    fl.write_ranking(out_dir, "cosmosfl", failing, passing, len(spectrum), formulas)
+
+
+if __name__ == "__main__":
+    main()

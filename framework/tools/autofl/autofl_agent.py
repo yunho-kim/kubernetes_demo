@@ -2,7 +2,7 @@
 """autofl_agent.py — AutoFL (Kang, An, Yoo, FSE 2024) ported to C, run inside the tool venv.
 
     autofl_agent.py --input input.json --out-dir <dir> [--reps 5] [--budget 10] [--num-tests 1]
-                    [--model M] [--base-url URL] [--protocol tools|text] [--temperature T]
+                    [--model M] [--base-url URL] [--protocol tools|text|cosmos] [--temperature T]
     autofl_agent.py --selftest
 
 Port of coinse/autofl (autofl.py + lib/d4j_interface.py), Java -> C:
@@ -17,6 +17,9 @@ Protocol (upstream runner.sh defaults): R repetitions, each rotating which faili
 test is shown first and showing 1 test; the first tool call is injected without
 asking the model; 10 steps, tool calls disabled on the last; then the model is
 asked for culprit signatures, one per line (multi-prediction mode).
+--protocol cosmos is COSMosFL's variant of this loop for small models (run_once_cosmos):
+functions described in the prompt (system_msg_expbug_with_funcs.txt), the conversation
+flattened into one prompt, "Function call:" lines parsed — used by framework/tools/cosmosfl.
 
 input.json (written by `run`):
   {"src": <checkout root>, "files": {file: {"failing_lines": [..], "per_test": {test: [..]}}},
@@ -268,6 +271,94 @@ def extract_calls(msg, protocol):
     return calls
 
 
+# ---------------------------------------------------------------- COSMosFL's small-model protocol
+# COSMosFL (Cho, Kang, An, Yoo, LLM4Code 2025; coinse/cosmosfl, utils/llm_utils.py OllamaEngine
+# and autofl/autofl.py) runs AutoFL on small models as instruction following instead of chat
+# tool calling: the conversation is flattened into one prompt ("[System] ...\n[User] ...\n
+# [Assistant] Function call: f(k=v)\n[Function] {...}\n[Assistant] "), sent as a single
+# generation request (Ollama /api/generate; here one user message to a chat endpoint, which
+# applies the model's template the same way), and the first "Function call:" line of the reply
+# is the call. The functions are described in system_msg_expbug_with_funcs.txt; the
+# directory-level coverage tool is not offered there (it is injected as the first call).
+COSMOS_ARG = {"get_failing_tests_covered_files": None, "get_failing_tests_covered_functions_for_file": "file_name"}
+
+
+def cosmos_prompt(messages):
+    def call2str(fc):
+        return fc["name"] + "(" + ", ".join(f"{k}={v}" for k, v in json.loads(fc["arguments"]).items()) + ")"
+    s = ""
+    for m in messages:
+        fc = f"Function call: {call2str(m['function_call'])}" if "function_call" in m else ""
+        s += f"[{m['role'].title()}] {m['content'] if m['content'] is not None else ''}{fc}\n"
+    return s + "[Assistant] "
+
+
+def cosmos_parse(text):
+    """Upstream OllamaEngine.parse_response: the reply as an assistant message, with a
+    function_call when a "Function call:" line is present (a malformed one raises, as upstream)."""
+    if text and "Function call:" in text:
+        call = next(l for l in text.splitlines() if "Function call:" in l).split("Function call:")[1].strip()
+        name = call.split("(")[0]
+        arg = call.split("(")[1].removesuffix(")")
+        if "=" in arg:
+            arg = arg.split("=")[-1]
+        arg = arg.strip('"').strip("'")
+        key = COSMOS_ARG.get(name, "signature")
+        return {"role": "assistant", "content": None,
+                "function_call": {"name": name, "arguments": json.dumps({key: arg} if key else {})}}
+    return {"role": "assistant", "content": text}
+
+
+def run_once_cosmos(llm, ri, tests, rep, args, system_msg):
+    fails = tests[rep % len(tests):] + tests[:rep % len(tests)]        # test_offset rotation
+    fails = fails[: args.num_tests]
+    names = [t["name"] for t in fails]
+    user = f"The test `{names}` failed.\n"
+    user += "The test looks like:\n\n```vtc\n" + "\n\n".join(t["snippet"].rstrip() for t in fails) + "\n```\n\n"
+    user += "It failed with the following error message and call stack:\n\n```\n" + "\n\n".join(t["fail_info"].rstrip() for t in fails) + "\n```\n\n"
+    user += f"Start by calling the `{INITIAL}` function."
+    messages = [{"role": "system", "content": system_msg + SYSTEM_SUFFIX_C}, {"role": "user", "content": user},
+                {"role": "assistant", "content": None, "function_call": {"name": INITIAL, "arguments": "{}"}},
+                {"role": "function", "name": INITIAL, "content": json.dumps(ri.fname2func[INITIAL]())}]
+
+    def ask():
+        return cosmos_parse(llm.chat([{"role": "user", "content": cosmos_prompt(messages)}]).content)
+
+    t0 = time.time(); steps = 0; calls_made = []
+    out = {"rep": rep, "tests_shown": names, "messages": messages}
+    try:
+        for _ in range(args.budget):
+            if time.time() - t0 > args.run_timeout:
+                break
+            msg = ask()
+            steps += 1
+            fc = msg.get("function_call")
+            if not fc:
+                messages.append(msg); break
+            try:                                     # upstream drops a call it cannot execute
+                result = ri.fname2func[fc["name"]](**json.loads(fc["arguments"]))
+            except Exception:
+                continue
+            messages.append(msg)
+            messages.append({"role": "function", "name": fc["name"], "content": json.dumps(result)})
+            calls_made.append({"name": fc["name"], "arguments": fc["arguments"]})
+        messages.append({"role": "user", "content": FINISH_C})
+        final = ask()
+        messages.append(final)
+        answer = final["content"].strip()            # a function call here fails the run, as upstream
+    except Exception as e:
+        out.update(error=repr(e), steps=steps, calls=calls_made, matched={}, seconds=round(time.time() - t0, 1))
+        return out
+    preds = [l.strip().strip("`-* ") for l in answer.splitlines() if l.strip()]
+    matched = {}
+    for p in preds:
+        for s in ri.matching_signatures(p):
+            matched.setdefault(s, []).append(p)
+    out.update(steps=steps, calls=calls_made, answer=answer, predictions=preds, matched=matched,
+               seconds=round(time.time() - t0, 1))
+    return out
+
+
 def run_once(llm, ri, tests, rep, args, system_msg):
     fails = tests[rep % len(tests):] + tests[:rep % len(tests)]        # test_offset rotation
     fails = fails[: args.num_tests]
@@ -347,7 +438,8 @@ def main():
     ap.add_argument("--num-tests", type=int, default=1)
     ap.add_argument("--model", default=os.environ.get("AUTOFL_MODEL", "gpt-4o-mini"))
     ap.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL"))
-    ap.add_argument("--protocol", default="tools", choices=("tools", "text"))
+    ap.add_argument("--protocol", default="tools", choices=("tools", "text", "cosmos"),
+                    help="cosmos: COSMosFL's flattened-prompt protocol for small models (no final re-ask)")
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--run-timeout", type=int, default=600)
     ap.add_argument("--finish-retry", type=int, default=1, help="re-ask once if the final answer names no function")
@@ -368,7 +460,9 @@ def main():
     json.dump(functions, open(os.path.join(args.out_dir, "functions.json"), "w"), indent=1)
     print(f"[autofl] indexed {len(functions)} functions covered by failing tests in {len({f['file'] for f in functions})} files", flush=True)
     ri = CInterface(functions, inp["failing_tests"])
-    system_msg = open(os.path.join(HERE, "system_msg_expbug.txt")).read().strip()
+    prompt = "system_msg_expbug_with_funcs.txt" if args.protocol == "cosmos" else "system_msg_expbug.txt"
+    system_msg = open(os.path.join(HERE, prompt)).read().strip()
+    once = run_once_cosmos if args.protocol == "cosmos" else run_once
     llm = LLM(args.model, args.base_url, args.protocol, args.temperature)
     print(f"[autofl] model={args.model} base_url={args.base_url or 'openai'} protocol={args.protocol} reps={args.reps} budget={args.budget}", flush=True)
     for rep in range(args.reps):
@@ -376,7 +470,7 @@ def main():
         if os.path.exists(path):
             print(f"[autofl] rep {rep}: exists, skipping", flush=True); continue
         try:
-            r = run_once(llm, ri, inp["failing_tests"], rep, args, system_msg)
+            r = once(llm, ri, inp["failing_tests"], rep, args, system_msg)
         except Exception as e:
             r = {"rep": rep, "error": repr(e), "matched": {}}
         json.dump(r, open(path, "w"), indent=1)

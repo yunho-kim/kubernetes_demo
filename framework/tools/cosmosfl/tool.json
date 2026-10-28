@@ -1,0 +1,8 @@
+{
+  "name": "cosmosfl",
+  "kind": "fl",
+  "description": "COSMosFL: an ensemble of small language models, each running AutoFL with COSMosFL's flattened-prompt protocol; the members' votes are combined by a weighted sum (equal weights by default)",
+  "reference": "H. Cho, S. Kang, G. An, S. Yoo. COSMosFL: Ensemble of Small Language Models for Fault Localisation. LLM4Code 2025 (ICSE 2025 workshop).",
+  "url": "https://github.com/coinse/cosmosfl",
+  "granularity": "function"
+}

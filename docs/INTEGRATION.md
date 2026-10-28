@@ -282,6 +282,12 @@ Reference implementations:
   identifiers in the test shown to the model are redacted by default, and the
   full conversation of every run is saved (`runs/rep<k>.json`) for audit.
   Function-level answers are expanded to line ranks as described in 4.5.
+* `framework/tools/cosmosfl/` — a **tool built on another adapter**: COSMosFL
+  runs the `autofl` adapter once per member model (with its small-model
+  protocol, `--protocol cosmos`) into `fl/cosmosfl/models/<model>/`, then
+  combines the members' votes. Its `prepare.sh` reuses the autofl venv instead
+  of installing a copy, and each member's own AutoFL ranking stays available
+  next to the ensemble's.
 
 ---
 
