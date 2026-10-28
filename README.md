@@ -37,7 +37,7 @@ framework/
 │   ├── flitsr/               # FLITSR / FLITSR* (ISSTA 2023) over the GZoltar spectrum
 │   ├── mbfl/                 # mutation-based FL: Mull mutants + Metallaxis / MUSE
 │   ├── llmao/                # LLMAO (ICSE 2024): test-free LLM fault localization
-│   ├── autofl/               # AutoFL (FSE 2024): LLM agent with code-navigation tools, ported to C
+│   ├── autofl/               # AutoFL (FSE 2024): LLM agent with code-navigation tools, ported to C and Go
 │   ├── cosmosfl/             # COSMosFL (LLM4Code 2025): ensemble of small models running AutoFL, votes combined
 │   ├── miniswe/              # mini-swe-agent (2025): LLM agent that edits/tests in a sandbox of the buggy image
 │   ├── openhands/            # OpenHands (ICLR 2025): CodeAct agent (terminal + file editor) on a sandboxed tree
@@ -200,7 +200,8 @@ bug's `tests/<bid>/` (haproxy: `trigger.vtc` + `regtests.txt`; kubernetes:
 then `cvebench compile/test/coverage`. A new project adds `framework/projects/<pid>/`
 with a `project.sh` module (hooks documented in `framework/lib/cvebench.sh`).
 
-The external tools `flitsr` (spectrum only) and `oracle` work on every project; the
-others under `framework/tools/` are still HAProxy-specific (vtest, gcov, `make`, C
-parsers). On the Kubernetes bugs the core harness (`checkout … validate`,
-`coverage`, built-in SBFL, `fl -t flitsr`, `apr -t oracle`) works today.
+The external tools `flitsr` (spectrum only), `autofl` and `cosmosfl` (C and Go ports)
+and `oracle` work on every project; the others under `framework/tools/` are still
+HAProxy-specific (vtest, gcov, `make`, C parsers). On the Kubernetes bugs the core
+harness (`checkout … validate`, `coverage`, built-in SBFL, `fl -t flitsr|autofl|cosmosfl`,
+`apr -t oracle`) works today.

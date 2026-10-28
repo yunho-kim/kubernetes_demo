@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""autofl_agent.py — AutoFL (Kang, An, Yoo, FSE 2024) ported to C, run inside the tool venv.
+"""autofl_agent.py — AutoFL (Kang, An, Yoo, FSE 2024) ported to C and Go, run inside the tool venv.
 
     autofl_agent.py --input input.json --out-dir <dir> [--reps 5] [--budget 10] [--num-tests 1]
                     [--model M] [--base-url URL] [--protocol tools|text|cosmos] [--temperature T]
@@ -8,6 +8,10 @@
 Port of coinse/autofl (autofl.py + lib/d4j_interface.py), Java -> C:
   class  -> source file          package -> directory
   method -> C function           signature = "<file>:<name>(<parameter types>)"
+Go (input "lang": "go"): the same with Go functions and methods; a method's signature carries
+its receiver type, "<file>:(*Type).Name(<parameter types>)". The failing test shown to the
+model is the Go test function, or, for a subtest of a long table-driven test, its table
+entry and the loop running the table (go_test_snippet).
 The four tools keep upstream's names modulo the class/method words:
   get_failing_tests_covered_files()                -> {directory: [file, ...]}
   get_failing_tests_covered_functions_for_file(f)  -> ["name(params)", ...]
@@ -23,7 +27,8 @@ flattened into one prompt, "Function call:" lines parsed — used by framework/t
 
 input.json (written by `run`):
   {"src": <checkout root>, "files": {file: {"failing_lines": [..], "per_test": {test: [..]}}},
-   "failing_tests": [{"id","name","snippet","fail_info"}]}
+   "failing_tests": [{"id","name","snippet","fail_info"}], "lang": "c" | "go"}
+  (a Go test may come with "snippet": null and "go_test": {"files","func","subtest"})
 Outputs: functions.json (index of failing-covered functions) and runs/rep<k>.json.
 """
 import argparse
@@ -39,39 +44,175 @@ FINISH = ("Based on the available information, provide the signatures of the mos
           "methods for the bug. Your answer will be processed automatically, so make sure to only "
           "answer with the accurate signatures of all likely culprits (in `ClassName.MethodName(ArgType1, ArgType2, ...)` "
           "format), without commentary (one per line). ")
-# C wording of the same instruction
-FINISH_C = FINISH.replace("methods", "functions").replace("`ClassName.MethodName(ArgType1, ArgType2, ...)`",
-                                                          "`path/to/file.c:function_name(ArgType1, ArgType2, ...)`")
-SYSTEM_SUFFIX_C = ("\n\nAfter providing this diagnosis, you will be prompted to suggest which functions would be the "
-                   "best locations to be fixed. The answers should be in the form of "
-                   "`path/to/file.c:function_name(ArgType1, ArgType2, ...)` without commentary (one per line), as your "
-                   "answer will be automatically processed before finally being presented to the user.")
 
-TOOLS = [
-    {"name": "get_failing_tests_covered_files",
-     "description": "This function retrieves a set of source files covered by failing tests and groups them by their directory names.",
-     "parameters": {"type": "object", "properties": {}, "required": []}},
-    {"name": "get_failing_tests_covered_functions_for_file",
-     "description": "This function takes a file_name as input and returns a list of function names covered by failing tests for the specified file in the program under test.",
-     "parameters": {"type": "object", "properties": {"file_name": {"type": "string",
-                    "description": "The path of the file in the program under test, e.g., \"src/h1.c\"."}},
-                    "required": ["file_name"]}},
-    {"name": "get_code_snippet",
-     "description": "This function takes a signature as input and returns the corresponding code snippet for the function.",
-     "parameters": {"type": "object", "properties": {"signature": {"type": "string",
-                    "description": "The signature of the function to retrieve the code snippet for. e.g. \"src/h1.c:h1_parse_msg_hdrs(struct h1m *, ...)\" or just \"h1_parse_msg_hdrs\""}},
-                    "required": ["signature"]}},
-    {"name": "get_comments",
-     "description": "This function takes a signature as input and returns the comment documentation (if available) for the function.",
-     "parameters": {"type": "object", "properties": {"signature": {"type": "string",
-                    "description": "The signature of the function to retrieve the documentation for."}},
-                    "required": ["signature"]}},
-]
+# Per-language wording: the signature form the model must answer in, the code fence of the
+# failing test, the examples in the tool descriptions and the system prompts.
+LANG = {
+    "c": {"sig": "`path/to/file.c:function_name(ArgType1, ArgType2, ...)`", "fence": "vtc",
+          "file_ex": "src/h1.c", "sig_ex": "src/h1.c:h1_parse_msg_hdrs(struct h1m *, ...)", "name_ex": "h1_parse_msg_hdrs",
+          "prompt": "system_msg_expbug.txt", "cosmos_prompt": "system_msg_expbug_with_funcs.txt"},
+    "go": {"sig": "`path/to/file.go:FunctionName(ArgType1, ArgType2, ...)` (a method: "
+                  "`path/to/file.go:(*Type).MethodName(ArgType1, ...)`)", "fence": "go",
+           "file_ex": "pkg/util/parsers/parsers.go", "sig_ex": "pkg/util/parsers/parsers.go:ParseImageName(string)",
+           "name_ex": "ParseImageName",
+           "prompt": "system_msg_expbug_go.txt", "cosmos_prompt": "system_msg_expbug_with_funcs_go.txt"},
+}
+
+
+def finish_msg(lang):
+    return FINISH.replace("methods", "functions").replace("`ClassName.MethodName(ArgType1, ArgType2, ...)`", LANG[lang]["sig"])
+
+
+def system_suffix(lang):
+    return ("\n\nAfter providing this diagnosis, you will be prompted to suggest which functions would be the "
+            f"best locations to be fixed. The answers should be in the form of {LANG[lang]['sig']} without "
+            "commentary (one per line), as your answer will be automatically processed before finally being "
+            "presented to the user.")
+
+
+def tools(lang):
+    L = LANG[lang]
+    return [
+        {"name": "get_failing_tests_covered_files",
+         "description": "This function retrieves a set of source files covered by failing tests and groups them by their directory names.",
+         "parameters": {"type": "object", "properties": {}, "required": []}},
+        {"name": "get_failing_tests_covered_functions_for_file",
+         "description": "This function takes a file_name as input and returns a list of function names covered by failing tests for the specified file in the program under test.",
+         "parameters": {"type": "object", "properties": {"file_name": {"type": "string",
+                        "description": f"The path of the file in the program under test, e.g., \"{L['file_ex']}\"."}},
+                        "required": ["file_name"]}},
+        {"name": "get_code_snippet",
+         "description": "This function takes a signature as input and returns the corresponding code snippet for the function.",
+         "parameters": {"type": "object", "properties": {"signature": {"type": "string",
+                        "description": f"The signature of the function to retrieve the code snippet for. e.g. \"{L['sig_ex']}\" or just \"{L['name_ex']}\""}},
+                        "required": ["signature"]}},
+        {"name": "get_comments",
+         "description": "This function takes a signature as input and returns the comment documentation (if available) for the function.",
+         "parameters": {"type": "object", "properties": {"signature": {"type": "string",
+                        "description": "The signature of the function to retrieve the documentation for."}},
+                        "required": ["signature"]}},
+    ]
+
+
 INITIAL = "get_failing_tests_covered_files"
 
 
-# ---------------------------------------------------------------- C function index (tree-sitter)
-def index_functions(src, files, failing_lines, per_test):
+# ---------------------------------------------------------------- function index (tree-sitter)
+def index_functions(lang, src, files, failing_lines, per_test):
+    return (index_go if lang == "go" else index_c)(src, files, failing_lines, per_test)
+
+
+def _covering_tests(rng, tests_per_line):
+    return len({t for ln in rng for t in tests_per_line.get(str(ln), [])})
+
+
+def _comment_before(node, data):
+    cm, prev = [], node.prev_named_sibling
+    while prev is not None and prev.type == "comment":
+        cm.insert(0, data[prev.start_byte:prev.end_byte].decode("utf-8", "replace")); prev = prev.prev_named_sibling
+    return "\n".join(cm)
+
+
+def go_param_types(plist, data):
+    """Parameter types of a Go parameter_list, one per parameter ("a, b int" -> int, int)."""
+    out = []
+    for p in plist.named_children if plist is not None else []:
+        if p.type not in ("parameter_declaration", "variadic_parameter_declaration"):
+            continue
+        t = p.child_by_field_name("type")
+        ts = " ".join(data[t.start_byte:t.end_byte].decode("utf-8", "replace").split()) if t is not None else ""
+        if p.type == "variadic_parameter_declaration":
+            ts = "..." + ts
+        out += [ts] * max(1, len(p.children_by_field_name("name")))
+    return ", ".join(out)
+
+
+def index_go(src, files, failing_lines, per_test):
+    """Go functions and methods covered by failing tests; a method's signature carries its
+    receiver type: "pkg/kubelet/server/server.go:(*Server).InstallDefaultHandlers()"."""
+    import tree_sitter_go as tsg
+    from tree_sitter import Language, Parser
+    parser = Parser(Language(tsg.language()))
+    out = []
+    for rel in sorted(files):
+        if not rel.endswith(".go"):
+            continue
+        try:
+            data = open(os.path.join(src, rel), "rb").read()
+        except OSError:
+            continue
+        lines = data.decode("utf-8", "replace").split("\n")
+        covered = set(failing_lines.get(rel, []))
+        for node in parser.parse(data).root_node.named_children:
+            if node.type not in ("function_declaration", "method_declaration"):
+                continue
+            nm = node.child_by_field_name("name")
+            name = data[nm.start_byte:nm.end_byte].decode("utf-8", "replace")
+            receiver = ""
+            if node.type == "method_declaration":
+                r = node.child_by_field_name("receiver")
+                rp = next((c for c in r.named_children if c.type == "parameter_declaration"), None) if r is not None else None
+                rt = rp.child_by_field_name("type") if rp is not None else None
+                receiver = " ".join(data[rt.start_byte:rt.end_byte].decode("utf-8", "replace").split()) if rt is not None else ""
+            params = go_param_types(node.child_by_field_name("parameters"), data)
+            b, e = node.start_point[0] + 1, node.end_point[0] + 1
+            rng = set(range(b, e + 1))
+            if not rng & covered:
+                continue
+            short = f"({receiver}).{name}({params})" if receiver else f"{name}({params})"
+            out.append({"signature": f"{rel}:{short}", "file": rel, "name": name, "receiver": receiver, "params": params,
+                        "short": short, "begin_line": b, "end_line": e, "comment": _comment_before(node, data),
+                        "snippet": "\n".join(lines[b - 1:e]), "num_failing_tests": _covering_tests(rng, per_test.get(rel, {}))})
+    return out
+
+
+def go_test_snippet(files, func, subtest, max_lines=200):
+    """Source of Go test `func` (in one of `files`). For a subtest of a long table-driven test,
+    the matching table entry and the loop running the table instead of the whole function."""
+    import tree_sitter_go as tsg
+    from tree_sitter import Language, Parser
+    parser = Parser(Language(tsg.language()))
+    for path in files:
+        try:
+            data = open(path, "rb").read()
+        except OSError:
+            continue
+        node = next((n for n in parser.parse(data).root_node.named_children if n.type == "function_declaration"
+                     and data[n.child_by_field_name("name").start_byte:n.child_by_field_name("name").end_byte].decode() == func), None)
+        if node is None:
+            continue
+        text = data[node.start_byte:node.end_byte].decode("utf-8", "replace")
+        if not subtest or text.count("\n") < max_lines:
+            return text
+        leaf = subtest.split("/")[-1]
+        entry, stack = None, [node]
+        while stack and entry is None:                 # the string literal naming the case -> its table entry
+            n = stack.pop()
+            if n.type in ("interpreted_string_literal", "raw_string_literal"):
+                lit = data[n.start_byte + 1:n.end_byte - 1].decode("utf-8", "replace")
+                if lit.replace(" ", "_") == leaf:
+                    p = n
+                    while p is not None and p.type != "keyed_element":
+                        p = p.parent
+                    if p is not None and p.parent is not None and p.parent.type == "literal_value":
+                        entry = p.parent
+            stack.extend(reversed(n.named_children))
+        body = node.child_by_field_name("body")
+        stmts = body.named_children if body is not None else []
+        if len(stmts) == 1 and stmts[0].type == "statement_list":       # tree-sitter-go >= 0.25
+            stmts = stmts[0].named_children
+        loop = next((c for c in reversed(stmts) if c.type == "for_statement"), None)
+        if entry is None:
+            return "\n".join(text.split("\n")[:max_lines]) + "\n\t// ... (truncated)"
+        part = lambda n: data[n.start_byte:n.end_byte].decode("utf-8", "replace")
+        out = [text.split("\n")[0], "\t// ...", f"\t// the test case \"{leaf}\":", "\t" + part(entry), "\t// ..."]
+        if loop is not None:
+            out += ["\t" + part(loop)]
+        return "\n".join(out + ["}"])
+    return f"(source of {func} not found)"
+
+
+def index_c(src, files, failing_lines, per_test):
     import tree_sitter_c as tsc
     from tree_sitter import Language, Parser
     parser = Parser(Language(tsc.language()))
@@ -134,10 +275,34 @@ def index_functions(src, files, failing_lines, per_test):
 
 
 # ---------------------------------------------------------------- repository interface
+def parse_go_signature(s):
+    """(file, receiver, name) of a free-form Go signature: "path/x.go:(*T).M(int)",
+    "x.go:F", "T.M", "(*T).M", "pkg.F", "F(...)", and the stack-trace forms
+    "k8s.io/kubernetes/pkg/x.(*T).M(...)", "pkg.(*T).M". A one-word qualifier may be a
+    receiver type or a package name; the caller narrows by it only when that matches something."""
+    s = re.sub(r"^\s*(?:[-*]|\d+[.)])\s+", "", s.strip().strip("`")).strip().strip("`")
+    file_part = recv = None
+    m = re.match(r"^([\w./-]+\.go)\s*:\s*", s)
+    if m:
+        file_part, s = m.group(1), s[m.end():]
+    s = re.sub(r"^[\w.-]+(?:/[\w.-]+)+\.(?=[A-Za-z_(])", "", s)     # import-path qualifier
+    m = re.match(r"^(?:[A-Za-z_]\w*\.)?\(\s*\*?\s*([A-Za-z_]\w*)[^)]*\)\s*\.\s*", s)
+    if m:
+        recv, s = m.group(1), s[m.end():]
+    m = re.match(r"^((?:[A-Za-z_]\w*\s*\.\s*)*)([A-Za-z_]\w*)\s*(\(|$)", s)
+    if not m:
+        return file_part, recv, None
+    quals = [q.strip() for q in m.group(1).split(".") if q.strip()]
+    return file_part, recv or (quals[-1] if quals else None), m.group(2)
+
+
 class CInterface:
-    def __init__(self, functions, tests):
+    """The four AutoFL tools over the function index (C, or Go with lang="go")."""
+
+    def __init__(self, functions, tests, lang="c"):
         self.functions = functions
         self.tests = tests
+        self.lang = lang
         self.by_name = {}
         for f in functions:
             self.by_name.setdefault(f["name"], []).append(f)
@@ -154,12 +319,14 @@ class CInterface:
         file_name = file_name.strip()
         fs = [f for f in self.functions if f["file"] == file_name or f["file"].endswith("/" + file_name)]
         if fs:
-            return [f"{f['name']}({f['params']})" for f in fs]
+            return [f.get("short") or f"{f['name']}({f['params']})" for f in fs]
         return {"error_message": f"No function information available for the file: {file_name}. "
                                  "The available file names can be found by calling get_failing_tests_covered_files()."}
 
     def _match(self, signature):
         """(exact, candidates) for a free-form signature the model wrote."""
+        if self.lang == "go":
+            return self._match_go(signature)
         s = signature.strip().strip("`")
         file_part, name = None, None
         m = re.match(r"^\s*([\w./-]+\.[ch])\s*[:.]\s*([A-Za-z_]\w*)", s)
@@ -174,6 +341,21 @@ class CInterface:
         cands = self.by_name.get(name, [])
         if file_part:
             narrowed = [f for f in cands if f["file"] == file_part or f["file"].endswith("/" + file_part)]
+            if narrowed:
+                cands = narrowed
+        if len(cands) == 1:
+            return cands[0], cands
+        return None, cands[:5]
+
+    def _match_go(self, signature):
+        file_part, recv, name = parse_go_signature(signature)
+        cands = self.by_name.get(name, []) if name else []
+        if file_part:
+            narrowed = [f for f in cands if f["file"] == file_part or f["file"].endswith("/" + file_part)]
+            if narrowed:
+                cands = narrowed
+        if recv:
+            narrowed = [f for f in cands if f["receiver"].lstrip("*").split("[")[0] == recv]
             if narrowed:
                 cands = narrowed
         if len(cands) == 1:
@@ -314,10 +496,10 @@ def run_once_cosmos(llm, ri, tests, rep, args, system_msg):
     fails = fails[: args.num_tests]
     names = [t["name"] for t in fails]
     user = f"The test `{names}` failed.\n"
-    user += "The test looks like:\n\n```vtc\n" + "\n\n".join(t["snippet"].rstrip() for t in fails) + "\n```\n\n"
+    user += f"The test looks like:\n\n```{LANG[ri.lang]['fence']}\n" + "\n\n".join(t["snippet"].rstrip() for t in fails) + "\n```\n\n"
     user += "It failed with the following error message and call stack:\n\n```\n" + "\n\n".join(t["fail_info"].rstrip() for t in fails) + "\n```\n\n"
     user += f"Start by calling the `{INITIAL}` function."
-    messages = [{"role": "system", "content": system_msg + SYSTEM_SUFFIX_C}, {"role": "user", "content": user},
+    messages = [{"role": "system", "content": system_msg + system_suffix(ri.lang)}, {"role": "user", "content": user},
                 {"role": "assistant", "content": None, "function_call": {"name": INITIAL, "arguments": "{}"}},
                 {"role": "function", "name": INITIAL, "content": json.dumps(ri.fname2func[INITIAL]())}]
 
@@ -342,7 +524,7 @@ def run_once_cosmos(llm, ri, tests, rep, args, system_msg):
             messages.append(msg)
             messages.append({"role": "function", "name": fc["name"], "content": json.dumps(result)})
             calls_made.append({"name": fc["name"], "arguments": fc["arguments"]})
-        messages.append({"role": "user", "content": FINISH_C})
+        messages.append({"role": "user", "content": finish_msg(ri.lang)})
         final = ask()
         messages.append(final)
         answer = final["content"].strip()            # a function call here fails the run, as upstream
@@ -364,12 +546,12 @@ def run_once(llm, ri, tests, rep, args, system_msg):
     fails = fails[: args.num_tests]
     names = [t["name"] for t in fails]
     user = f"The test `{names}` failed.\n"
-    user += "The test looks like:\n\n```vtc\n" + "\n\n".join(t["snippet"].rstrip() for t in fails) + "\n```\n\n"
+    user += f"The test looks like:\n\n```{LANG[ri.lang]['fence']}\n" + "\n\n".join(t["snippet"].rstrip() for t in fails) + "\n```\n\n"
     user += "It failed with the following error message and call stack:\n\n```\n" + "\n\n".join(t["fail_info"].rstrip() for t in fails) + "\n```\n\n"
     user += f"Start by calling the `{INITIAL}` function."
-    sysmsg = system_msg + SYSTEM_SUFFIX_C
+    sysmsg = system_msg + system_suffix(ri.lang)
     if args.protocol == "text":
-        sysmsg += TEXT_PROTOCOL.format(tools=", ".join(t["name"] + "(" + ", ".join(t["parameters"]["properties"]) + ")" for t in TOOLS))
+        sysmsg += TEXT_PROTOCOL.format(tools=", ".join(t["name"] + "(" + ", ".join(t["parameters"]["properties"]) + ")" for t in tools(ri.lang)))
     messages = [{"role": "system", "content": sysmsg}, {"role": "user", "content": user}]
     # upstream injects the first call without asking the model
     first = json.dumps(ri.fname2func[INITIAL]())
@@ -385,7 +567,7 @@ def run_once(llm, ri, tests, rep, args, system_msg):
         if time.time() - t0 > args.run_timeout:
             break
         choice = "none" if i == args.budget - 1 else "auto"
-        msg = llm.chat(messages, TOOLS, choice)
+        msg = llm.chat(messages, tools(ri.lang), choice)
         steps += 1
         calls = extract_calls(msg, args.protocol)
         if not calls or choice == "none":
@@ -402,7 +584,7 @@ def run_once(llm, ri, tests, rep, args, system_msg):
                 messages.append({"role": "tool", "tool_call_id": cid, "name": fname, "content": json.dumps(result)})
             else:
                 messages.append({"role": "user", "content": f"Result of {fname}: {json.dumps(result)}"})
-    messages.append({"role": "user", "content": FINISH_C})
+    messages.append({"role": "user", "content": finish_msg(ri.lang)})
     final = llm.chat(messages)
     answer = (final.content or "").strip()
     messages.append({"role": "assistant", "content": answer})
@@ -447,20 +629,28 @@ def main():
     args = ap.parse_args()
 
     if args.selftest:
-        import openai, tree_sitter_c  # noqa: F401
+        import openai, tree_sitter_c, tree_sitter_go  # noqa: F401
         from tree_sitter import Language, Parser
         Parser(Language(tree_sitter_c.language())).parse(b"int f(int a) { return a; }")
-        print(f"autofl deps OK (openai {openai.__version__}, tree-sitter-c)"); return
+        Parser(Language(tree_sitter_go.language())).parse(b"package p\nfunc f(a int) int { return a }")
+        print(f"autofl deps OK (openai {openai.__version__}, tree-sitter-c, tree-sitter-go)"); return
 
     inp = json.load(open(args.input))
     os.makedirs(os.path.join(args.out_dir, "runs"), exist_ok=True)
-    functions = index_functions(inp["src"], list(inp["files"]),
+    lang = inp.get("lang", "c")
+    functions = index_functions(lang, inp["src"], list(inp["files"]),
                                 {f: v["failing_lines"] for f, v in inp["files"].items()},
                                 {f: v["per_line_tests"] for f, v in inp["files"].items()})
     json.dump(functions, open(os.path.join(args.out_dir, "functions.json"), "w"), indent=1)
     print(f"[autofl] indexed {len(functions)} functions covered by failing tests in {len({f['file'] for f in functions})} files", flush=True)
-    ri = CInterface(functions, inp["failing_tests"])
-    prompt = "system_msg_expbug_with_funcs.txt" if args.protocol == "cosmos" else "system_msg_expbug.txt"
+    for t in inp["failing_tests"]:                # Go: the test function (or table entry) from its source
+        if t.get("snippet") is None and t.get("go_test"):
+            g = t["go_test"]
+            t["snippet"] = go_test_snippet(g["files"], g["func"], g.get("subtest"))
+            if g.get("redact", True):
+                t["snippet"] = re.sub(r"CVE-\d{4}-\d+", "CVE-XXXX-XXXXX", t["snippet"])
+    ri = CInterface(functions, inp["failing_tests"], lang)
+    prompt = LANG[lang]["cosmos_prompt" if args.protocol == "cosmos" else "prompt"]
     system_msg = open(os.path.join(HERE, prompt)).read().strip()
     once = run_once_cosmos if args.protocol == "cosmos" else run_once
     llm = LLM(args.model, args.base_url, args.protocol, args.temperature)
