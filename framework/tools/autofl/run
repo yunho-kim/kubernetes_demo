@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""run — cvebench adapter for AutoFL (Kang, An, Yoo, FSE 2024), ported to C.
+"""run — cvebench adapter for AutoFL (Kang, An, Yoo, FSE 2024), ported to C and Go.
 
     run <results-dir> [-o <out-dir>] [--reps 5] [--budget 10] [--num-tests 1]
         [--model M] [--base-url URL] [--protocol tools|text|cosmos] [--temperature T] [--fresh]
@@ -11,7 +11,8 @@ LLM endpoint: any OpenAI-compatible chat API with function/tool calling —
 
 Pipeline
   1. cvebench checkout -v buggy -> <out-dir>/workdir ; failing-test snippets (the .vtc
-     files) and their failure output (re-run in the buggy image, cached in failinfo.json)
+     files; for Go the test function, cut from its source by the agent) and their failure
+     output (re-run in the buggy image — vtest / go test -v — cached in failinfo.json)
   2. input.json: files/lines executed by failing tests (from the spectrum)
   3. .venv/bin/python autofl_agent.py : tree-sitter function index + R LLM runs
   4. scoring = upstream compute_score.py: each run spreads a vote of 1 over the
@@ -23,6 +24,7 @@ Pipeline
 """
 import argparse
 import collections
+import glob
 import json
 import os
 import re
@@ -36,6 +38,7 @@ import flcommon as fl  # noqa: E402
 
 VENV_PY = os.path.join(HERE, ".venv", "bin", "python")
 CVEBENCH = os.path.join(FW_ROOT, "bin", "cvebench")
+LANG_OF = {"haproxy": "c", "kubernetes": "go"}      # language of each project's sources and tests
 
 
 def sh(cmd, **kw):
@@ -54,6 +57,38 @@ def fail_info(pid, bid, version, vtc_path, vtc_text):
                        input=vtc_text, capture_output=True, text=True)
     out = r.stdout.strip()
     return out if out else "(test failed without an expectation message; see vtest log)"
+
+
+def go_fail_info(pid, bid, version, pdir, tid):
+    """Re-run one failing Go test (`<pkg>::<Test>/<sub>`) in the buggy image and keep its
+    failure: test messages, panics and the stack frames in the project (vendored, runtime
+    and testing frames dropped, argument values elided), as upstream's minimized traces."""
+    img = f"cvebench:{pid}-{bid}-buggy"
+    if sh(["docker", "image", "inspect", img]).returncode != 0:
+        return "(failure output unavailable: buggy image not built — cvebench compile)"
+    src = f"/build/{pid}-{version}"
+    pkg, name = tid.split("::", 1)
+    pattern = "/".join("^" + re.sub(r"([\\.+*?()|\[\]{}^$])", r"\\\1", p) + "$" for p in name.split("/"))
+    overlay = os.path.join(pdir, "tests", bid, "overlay")
+    mount = ["-v", f"{overlay}:/overlay:ro"] if os.path.isdir(overlay) else []
+    r = subprocess.run(["docker", "run", "--rm", "--network", "none", "-e", f"RUN={pattern}", *mount, img, "bash", "-c",
+                        f'[ -d /overlay ] && cp -r /overlay/. {src}/; cd {src} && go test -count=1 -v -run "$RUN" ./{pkg} 2>&1'],
+                       capture_output=True, text=True, timeout=1800)
+    lines, keep = r.stdout.splitlines(), []
+    for i, l in enumerate(lines):
+        st = l.strip()
+        if st.startswith(("--- FAIL", "panic:", "Error Trace:", "Error:", "Messages:", "expected", "actual")) \
+                or re.search(r"\b\w+_test\.go:\d+: ", l):
+            keep.append(st)
+        elif l.startswith("\t" + src + "/") and "/vendor/" not in l and i:      # a project frame
+            keep.append(re.sub(r"\((?:0x|\{|\.\.\.).*\)$", "(...)", lines[i - 1].strip()))
+            keep.append("\t" + st)
+    out = []
+    for l in keep:
+        l = re.sub(r" \+0x[0-9a-f]+$", "", l.replace(src + "/", ""))
+        if not out or l.strip() != out[-1].strip():
+            out.append(l)
+    return "\n".join(out[:40]) if out else "(test failed without a failure message)"
 
 
 def main():
@@ -100,13 +135,26 @@ def main():
         r = sh([CVEBENCH, "checkout", "-p", pid, "-b", bid, "-v", "buggy", "-w", wd])
         if r.returncode != 0:
             raise SystemExit("checkout failed: " + r.stderr)
-    src = next(os.path.join(wd, d) for d in os.listdir(wd) if d.startswith("haproxy-"))
+    src = os.path.join(wd, f"{pid}-{version}")
+    lang = LANG_OF.get(pid, "c")
 
     # ---- failing tests: snippet + failure output (cached)
     cache_p = os.path.join(out_dir, "failinfo.json")
     cache = json.load(open(cache_p)) if os.path.exists(cache_p) else {}
     ftests = []
     for t in failing:
+        if lang == "go":                         # the agent cuts the snippet from the test source (tree-sitter-go)
+            pkg, tname = t.split("::", 1)
+            top, _, sub = tname.partition("/")
+            files = sorted(glob.glob(os.path.join(src, pkg, "*_test.go")) +
+                           glob.glob(os.path.join(pdir, "tests", bid, "overlay", pkg, "*_test.go")))
+            if t not in cache:
+                print(f"[autofl] collecting failure output of {t}", flush=True)
+                cache[t] = go_fail_info(pid, bid, version, pdir, t)
+                json.dump(cache, open(cache_p, "w"), indent=1)
+            ftests.append({"id": t, "name": t, "snippet": None, "fail_info": cache[t],
+                           "go_test": {"files": files, "func": top, "subtest": sub or None, "redact": not args.no_redact}})
+            continue
         vtc = vtc_of.get(t, "")
         if t == "_sbfl_trigger_vtc":
             path = os.path.join(pdir, "tests", bid, "trigger.vtc")
@@ -130,7 +178,7 @@ def main():
         for f, ln in fl.load_coverage(os.path.join(args.results, tests[t]["coverage"])):
             d = files.setdefault(f, {"failing_lines": set(), "per_line_tests": collections.defaultdict(list)})
             d["failing_lines"].add(ln); d["per_line_tests"][str(ln)].append(t)
-    inp = {"src": src, "failing_tests": ftests,
+    inp = {"src": src, "lang": lang, "failing_tests": ftests,
            "files": {f: {"failing_lines": sorted(d["failing_lines"]), "per_line_tests": dict(d["per_line_tests"])} for f, d in files.items()}}
     json.dump(inp, open(os.path.join(out_dir, "input.json"), "w"))
     print(f"[autofl] {name}: {F} failing tests, {len(files)} files executed by them", flush=True)

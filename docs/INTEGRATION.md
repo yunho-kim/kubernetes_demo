@@ -274,7 +274,7 @@ Reference implementations:
   third-party packages itself.
 * `framework/tools/autofl/` — an **LLM agent that needs an API**: the upstream
   Java protocol (four code-navigation functions, R repetitions, vote scoring)
-  is ported to C with a tree-sitter function index. The endpoint is configured
+  is ported to C and Go with tree-sitter function indexes. The endpoint is configured
   only through `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `AUTOFL_MODEL`, so the
   same adapter runs against OpenAI, a local llama.cpp/vLLM server, or any
   compatible gateway; `--protocol text` covers servers without tool calling.
@@ -529,6 +529,7 @@ for crash-driven techniques.
   in its own goroutine (the images' Go `testing` package writes the profile
   before re-panicking, `build/cover-on-panic.py`); a panic elsewhere, or a test
   timeout, loses that test's coverage and the test is excluded.
-* The external FL / APR tools under `framework/tools/` other than `flitsr` and
-  `oracle` are still HAProxy-specific (vtest, gcov, `make`, C parsers); the core
-  harness (`checkout … validate`, `coverage`, built-in SBFL) supports both projects.
+* The external FL / APR tools under `framework/tools/` other than `flitsr`,
+  `autofl`, `cosmosfl` and `oracle` are still HAProxy-specific (vtest, gcov, `make`,
+  C parsers); the core harness (`checkout … validate`, `coverage`, built-in SBFL)
+  supports both projects.

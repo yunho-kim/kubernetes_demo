@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""run — cvebench adapter for COSMosFL (Cho, Kang, An, Yoo, LLM4Code 2025), ported to C.
+"""run — cvebench adapter for COSMosFL (Cho, Kang, An, Yoo, LLM4Code 2025), ported to C and Go.
 
     run <results-dir> [-o <out-dir>] [--models llama3,llama3.1,mistral-nemo,qwen2.5-coder]
         [--base-url URL] [--reps 5] [--weights W1,W2,...] [--budget 10] [--temperature T]
