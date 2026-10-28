@@ -244,6 +244,11 @@ expand each ranked unit to its executable lines (all lines of that unit that
 appear in `gzoltar/spectra`), giving them the unit's score; ties within a unit
 are then reported as a `best–worst` range, which is the standard
 optimistic/pessimistic treatment. Say so in `tool.json` (`"granularity"`).
+A function holds tens to hundreds of executable lines, so such ranges are wide
+(AutoFL: 1–302 on haproxy-3). Report a line-level refinement as an extra
+formula next to the tool's own, e.g. `autofl_op2tb` (lines ordered by Op2
+within each function) or `autofl_line` (the model is asked for lines after its
+function answer).
 
 ### 4.6 Checklist
 

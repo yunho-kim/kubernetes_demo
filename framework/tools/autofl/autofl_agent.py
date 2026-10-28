@@ -541,6 +541,49 @@ def run_once_cosmos(llm, ri, tests, rep, args, system_msg):
     return out
 
 
+# ---------------------------------------------------------------- statement-level follow-up (autofl_line)
+# Not part of published AutoFL: after the function answer, one more question asks which lines of
+# those functions to change. It comes last, so the function answer (and the autofl / autofl_op2tb
+# formulas) is unaffected; runs saved before it existed get it as a follow-up on their conversation.
+def line_question(lang):
+    ext = "go" if lang == "go" else "c"
+    return ("For each culprit function you listed, which lines should be changed to fix the bug? Use the line "
+            "numbers shown in the code snippets; if the fix adds missing code, give the line after which it should "
+            "be inserted. Your answer will be processed automatically, so answer only with lines of the form "
+            f"`path/to/file.{ext}:LINE` (one per line, most likely first), without commentary.")
+
+
+def parse_lines(answer, ri, matched):
+    """[(file, line)] named in a line answer ("file:LINE", "file:function:LINE", "file:A-B"),
+    kept only inside the functions covered by failing tests. A number whose file is missing or
+    wrong (e.g. "src/htx.c:469" for include/haproxy/htx.h) is read against the numbered code of
+    the functions the run named, which is where the model took it from."""
+    files = sorted({f["file"] for f in ri.functions})
+    resolve = lambda n: n if n in files else next((f for f in files if f.endswith("/" + n)), None)
+    inside = lambda f, n: any(x["file"] == f and x["begin_line"] <= n <= x["end_line"] for x in ri.functions)
+    named = [x for x in ri.functions if x["signature"] in matched]
+    cited = []                                   # (file or None, line)
+    for m in re.finditer(r"([\w./-]+\.(?:c|h|go))\s*:\s*(?:[^:\s]*\s*:\s*)?L?(\d+)(?:\s*[-–]\s*(\d+))?", answer or ""):
+        a = int(m.group(2)); b = int(m.group(3)) if m.group(3) else a
+        cited += [(resolve(m.group(1)), n) for n in range(a, min(max(a, b), a + 20) + 1)]
+    if not cited:
+        cited = [(None, n) for n in map(int, re.findall(r"\b(\d{1,6})\b", answer or ""))]
+    out = []
+    for f, n in cited:
+        if f and inside(f, n):
+            out.append((f, n))
+        else:
+            out += [(x["file"], n) for x in named if x["begin_line"] <= n <= x["end_line"]][:1]
+    return list(dict.fromkeys(out))
+
+
+def ask_lines(llm, ri, messages, matched):
+    messages.append({"role": "user", "content": line_question(ri.lang)})
+    answer = (llm.chat(messages).content or "").strip()
+    messages.append({"role": "assistant", "content": answer})
+    return answer, parse_lines(answer, ri, matched)
+
+
 def run_once(llm, ri, tests, rep, args, system_msg):
     fails = tests[rep % len(tests):] + tests[:rep % len(tests)]        # test_offset rotation
     fails = fails[: args.num_tests]
@@ -609,8 +652,10 @@ def run_once(llm, ri, tests, rep, args, system_msg):
         answer = (final.content or "").strip()
         messages.append({"role": "assistant", "content": answer})
         preds, matched = parse(answer)
+    line_answer, lines = ask_lines(llm, ri, messages, matched)
     return {"rep": rep, "tests_shown": names, "steps": steps, "calls": calls_made, "answer": answer,
-            "predictions": preds, "matched": matched, "messages": messages, "seconds": round(time.time() - t0, 1)}
+            "predictions": preds, "matched": matched, "line_answer": line_answer, "lines": lines,
+            "messages": messages, "seconds": round(time.time() - t0, 1)}
 
 
 def main():
@@ -665,8 +710,29 @@ def main():
             r = {"rep": rep, "error": repr(e), "matched": {}}
         json.dump(r, open(path, "w"), indent=1)
         print(f"[autofl] rep {rep}: steps={r.get('steps')} calls={len(r.get('calls', []))} "
-              f"predictions={r.get('predictions')} matched={list(r.get('matched', {}))} ({r.get('seconds')}s)"
-              + (f" ERROR {r['error']}" if "error" in r else ""), flush=True)
+              f"predictions={r.get('predictions')} matched={list(r.get('matched', {}))} lines={r.get('lines')} "
+              f"({r.get('seconds')}s)" + (f" ERROR {r['error']}" if "error" in r else ""), flush=True)
+    # runs saved before the line question existed: ask it as a follow-up on the saved conversation
+    if args.protocol != "cosmos":
+        for rep in range(args.reps):
+            path = os.path.join(args.out_dir, "runs", f"rep{rep}.json")
+            r = json.load(open(path)) if os.path.exists(path) else None
+            if r and "line_answer" in r:             # re-parse, so parser fixes reach saved runs
+                lines = [list(p) for p in parse_lines(r["line_answer"], ri, r.get("matched", {}))]
+                if lines != r.get("lines"):
+                    r["lines"] = lines
+                    json.dump(r, open(path, "w"), indent=1)
+                    print(f"[autofl] rep {rep}: lines re-parsed {lines}", flush=True)
+                continue
+            if not r or "error" in r or not r.get("messages"):
+                continue
+            try:
+                r["line_answer"], r["lines"] = ask_lines(llm, ri, r["messages"], r.get("matched", {}))
+            except Exception as e:
+                print(f"[autofl] rep {rep}: line follow-up failed: {e!r}", flush=True); continue
+            r["line_followup"] = True
+            json.dump(r, open(path, "w"), indent=1)
+            print(f"[autofl] rep {rep}: lines (follow-up on the saved run) {r['lines']}", flush=True)
 
 
 if __name__ == "__main__":
