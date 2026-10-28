@@ -38,6 +38,7 @@ framework/
 │   ├── mbfl/                 # mutation-based FL: Mull mutants + Metallaxis / MUSE
 │   ├── llmao/                # LLMAO (ICSE 2024): test-free LLM fault localization
 │   ├── autofl/               # AutoFL (FSE 2024): LLM agent with code-navigation tools, ported to C
+│   ├── cosmosfl/             # COSMosFL (LLM4Code 2025): ensemble of small models running AutoFL, votes combined
 │   ├── miniswe/              # mini-swe-agent (2025): LLM agent that edits/tests in a sandbox of the buggy image
 │   ├── openhands/            # OpenHands (ICLR 2025): CodeAct agent (terminal + file editor) on a sandboxed tree
 │   ├── darjeeling/           # Darjeeling: GenProg-style search-based repair (Kaskara/clang statement edits)
@@ -102,6 +103,8 @@ $cvebench fl       -p haproxy -b 3 -t llmao -- --model 6B  # LLM-based, test-fre
 $cvebench prepare  -t autofl                     # one-off: venv with openai client + tree-sitter
 OPENAI_BASE_URL=http://127.0.0.1:8080/v1 OPENAI_API_KEY=none AUTOFL_MODEL=<name> \
 $cvebench fl       -p haproxy -b 3 -t autofl     # LLM agent FL (any OpenAI-compatible endpoint), R=5 runs
+$cvebench prepare  -t cosmosfl -- --pull         # one-off: reuse the autofl venv; pull the 4 small models into Ollama
+$cvebench fl       -p haproxy -b 3 -t cosmosfl   # COSMosFL: AutoFL x {llama3, llama3.1, mistral-nemo, qwen2.5-coder}, 5 runs each
 $cvebench summary  [-t flitsr] [-f ochiai]       # bug x tool x formula: fault rank + EXAM
 ```
 
