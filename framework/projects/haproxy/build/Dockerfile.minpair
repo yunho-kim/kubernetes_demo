@@ -30,9 +30,11 @@ RUN BR="$(echo "$HAPROXY_VERSION" | cut -d. -f1,2)" \
 COPY "$FIX_PATCH" /tmp/fix.patch
 
 WORKDIR /build/haproxy-${HAPROXY_VERSION}
-# buggy = fixed release with the fix reverse-applied (minimal pair)
+# buggy = fixed release with the fix reverse-applied (minimal pair). --no-backup-if-mismatch:
+# a hunk applied at an offset would otherwise leave <file>.orig = the FIXED file in the image
+# (haproxy-2/3 did, and APR agents read it).
 RUN if [ "$VARIANT" = "buggy" ]; then \
-        echo "== reverse-applying fix to create BUGGY ==" && patch -R -p1 < /tmp/fix.patch ; \
+        echo "== reverse-applying fix to create BUGGY ==" && patch -R -p1 --no-backup-if-mismatch < /tmp/fix.patch ; \
     else echo "== FIXED variant (no patch) ==" ; fi
 COPY "$CANDIDATE_PATCH" /tmp/candidate.patch
 RUN if [ -s /tmp/candidate.patch ]; then \

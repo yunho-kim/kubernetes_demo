@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""run — cvebench APR adapter for FAngelix (Yi & Ismayilzada, IST 2022), an extension of Angelix.
+
+    run <results-dir> <workdir> -o <out-dir> [--fl sbfl[:ochiai] | --fl TOOL[:FORMULA] | --file src/x.c]
+        [--files 3] [--time-limit 3600] [--test-timeout 90] [--defect if-conditions loop-conditions]
+        [--all-files] [--keep] [-- <extra angelix options>]
+
+FAngelix is semantics-based repair for C: it instruments the repairable if/loop conditions
+of ONE source file, localizes them with the tests' traces, searches angelic values of the
+suspicious conditions that make the failing tests pass (MCMC sampling, guided by the
+oracle's optional cost function; Angelix proper uses KLEE) and synthesizes a replacement
+expression (Z3/MaxSMT) consistent with all tests. It runs unchanged in its own image
+(cvebench-fangelix, `prepare.sh`), one `angelix` run per file, and the patch it prints is
+exported with `cvebench diff` as candidates/<n>-<file>.patch.
+
+What the benchmark supplies:
+  * the file(s) to repair — Angelix needs the buggy file named. Taken from an FL ranking
+    (--fl, default the built-in SBFL Ochiai over the whole spectrum): the --files distinct
+    .c files of the top-ranked lines, tried in order within --time-limit; stops at the first
+    patch unless --all-files. --file names one file instead (for experiments; giving the
+    fixed file is an oracle-localization setting, not the tool's).
+  * the tests — the trigger test(s) (negative) and the bug's relevant reg-tests (positive),
+    run by vtest through `oracle <id>` (exit 0 = pass). Every test is first run once on a
+    plain build of the buggy tree: relevant tests that fail there are left out (Angelix
+    needs passing tests to pass), recorded in fangelix.json.
+  * the build — the benchmark's flags without coverage (-O0 -g) and DEFINE=-DMAX_THREADS=1:
+    Angelix's runtime appends traces from every thread to one file, so HAProxy runs with one
+    thread (threading stays compiled in: the watchdog ends the infinite-loop triggers). The
+    candidate is validated by the harness with the benchmark's own build.
+No cost function is given (FAngelix then searches without one, as its README allows).
+Repairable expressions are side-effect-free conditions (no function calls) — Angelix's
+repair space; a fix elsewhere is out of reach by design.
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
+import aprsandbox as sb  # noqa: E402
+
+ORACLE = r"""#!/bin/bash
+# oracle <test-id>: run one HAProxy reg-test with vtest against ./haproxy of the build in the
+# current directory (Angelix runs tests from the root of its copy of the tree).
+T=$(awk -v id="$1" '$1 == id {print $2}' /fa/tests.txt)
+[ -n "$T" ] || { echo "unknown test $1" >&2; exit 2; }
+export HAPROXY_PROGRAM="$PWD/haproxy"
+ulimit -n 65536 2>/dev/null || ulimit -n 4096 2>/dev/null || true
+# ANGELIX_RUN exports Angelix's trace/load variables; vtest passes them on to haproxy
+${ANGELIX_RUN:-eval} timeout -s KILL 60 vtest -q "$T" >/dev/null 2>&1
+"""
+
+BUILD = """#!/bin/bash
+# FAngelix build command (one word: Angelix runs `bear <build>`, and the image's Bear 2.1.4
+# hands only the first word of a command to the shell). CC comes from Angelix (make -e).
+exec make -e -j"$(nproc)" TARGET=linux-glibc USE_OPENSSL= USE_PCRE= USE_PCRE2= USE_ZLIB= USE_LUA= \\
+     USE_SYSTEMD= CPU_CFLAGS=-O0 DEBUG_CFLAGS=-g DEFINE=-DMAX_THREADS=1 {extra}
+"""
+
+
+def fl_files(results, spec, k):
+    """Distinct src/*.c files of an FL ranking's top lines, best first."""
+    tool, _, formula = spec.partition(":")
+    if tool == "sbfl":  # the whole spectrum, not just ranking.json's top 15
+        with tempfile.TemporaryDirectory() as tmp:
+            r = sb.sh([sys.executable, os.path.join(FW_ROOT, "bin", "sbfl-rank"), "-r", results,
+                       "--formula", formula or "ochiai", "--top", "1000000", "-o", tmp])
+            p = os.path.join(tmp, "ranking.json")
+            if r.returncode != 0 or not os.path.exists(p):
+                raise SystemExit(f"--fl {spec}: sbfl-rank failed (cvebench coverage first?): {r.stderr[-500:]}")
+            rk = json.load(open(p))
+    else:
+        p = os.path.join(results, "fl", tool, "ranking.json")
+        if not os.path.exists(p):
+            raise SystemExit(f"--fl {spec}: {p} not found (cvebench fl -t {tool})")
+        rk = json.load(open(p))
+    fs = rk["formulas"]
+    name = formula or next(iter(fs))
+    files = []
+    for row in fs[name]["top"]:
+        f = row["file"]
+        if f.endswith(".c") and f not in files:
+            files.append(f)
+        if len(files) >= k:
+            break
+    return name, files
+
+
+def main():
+    argv = sys.argv[1:]
+    extra = argv[argv.index("--") + 1:] if "--" in argv else []
+    argv = argv[:argv.index("--")] if "--" in argv else argv
+    ap = argparse.ArgumentParser()
+    ap.add_argument("results")
+    ap.add_argument("workdir")
+    ap.add_argument("-o", "--out-dir", required=True)
+    ap.add_argument("--fl", default="sbfl:ochiai", metavar="TOOL[:FORMULA]", help="FL ranking that picks the files")
+    ap.add_argument("--files", type=int, default=3, help="how many top-ranked .c files to try")
+    ap.add_argument("--file", default=None, help="repair this file only (src/....c)")
+    ap.add_argument("--all-files", action="store_true", help="keep trying files after a patch")
+    ap.add_argument("--time-limit", type=int, default=3600, help="seconds for the whole run")
+    ap.add_argument("--test-timeout", type=int, default=90)
+    ap.add_argument("--defect", nargs="+", default=["if-conditions", "loop-conditions"])
+    ap.add_argument("--keep", action="store_true", help="keep the sources and logs under <out-dir>/fa")
+    args = ap.parse_args(argv)
+
+    prep = os.path.join(HERE, ".prepared")
+    if not os.path.exists(prep):
+        raise SystemExit(f"fangelix not prepared — run {HERE}/prepare.sh (cvebench prepare -t fangelix)")
+    image = open(prep).read().strip()
+    bug = sb.Bug(args.workdir)
+    if bug.pid != "haproxy":
+        raise SystemExit("fangelix: C programs only (haproxy)")
+    out_dir = os.path.abspath(args.out_dir)
+    fa = os.path.join(out_dir, "fa")
+    if os.path.isdir(fa):
+        shutil.rmtree(fa)
+    os.makedirs(fa)
+    os.makedirs(os.path.join(out_dir, "candidates"), exist_ok=True)
+    for f in os.listdir(os.path.join(out_dir, "candidates")):
+        os.remove(os.path.join(out_dir, "candidates", f))
+
+    # ---- files to repair
+    if args.file:
+        formula, files = None, [args.file]
+    else:
+        formula, files = fl_files(args.results, args.fl, args.files)
+    if not files:
+        raise SystemExit(f"--fl {args.fl}: no .c file among the ranked lines")
+
+    # ---- tree, tests, oracle, build
+    tree = os.path.basename(bug.src)
+    shutil.copytree(os.path.join(args.workdir, tree), os.path.join(fa, "src"), symlinks=True)
+    shutil.copy(os.path.join(args.workdir, "cvebench-tests", "trigger.vtc"), os.path.join(fa, "trigger.vtc"))
+    trig_ids = [l.strip() for l in open(os.path.join(bug.pdir, "trigger_tests", bug.bid)) if l.strip()]
+    rel_ids = {l.strip() for l in open(os.path.join(bug.pdir, "relevant_tests", bug.bid)) if l.strip()}
+    globs = [l.strip() for l in open(os.path.join(bug.pdir, "tests", bug.bid, "regtests.txt"))
+             if l.strip() and not l.lstrip().startswith("#")]
+    vtcs = {}
+    for g in globs:  # same resolution as aprsandbox.setup_cmd: reg-tests/<path>.vtc -> <path with / . as _>
+        for p in sorted(subprocess.run(["bash", "-c", f"cd {os.path.join(fa, 'src')} && ls {g} 2>/dev/null"],
+                                       capture_output=True, text=True).stdout.split()):
+            vtcs[p.replace("reg-tests/", "", 1).replace("/", "_").replace(".", "_")] = p
+    tests = []
+    for tid in trig_ids + sorted(rel_ids - set(trig_ids)):
+        if tid == "_sbfl_trigger_vtc":
+            tests.append((tid, "/fa/trigger.vtc"))
+        elif tid in vtcs:
+            tests.append((tid, "/fa/src/" + vtcs[tid]))
+    with open(os.path.join(fa, "tests.txt"), "w") as fh:
+        fh.writelines(f"{t} {p}\n" for t, p in tests)
+    with open(os.path.join(fa, "triggers.txt"), "w") as fh:
+        fh.writelines(f"{t}\n" for t in trig_ids)
+    with open(os.path.join(fa, "files.txt"), "w") as fh:
+        fh.writelines(f"{f}\n" for f in files)
+    extra_make = sb.make_args(bug)[len(sb.MAKE_ARGS):].strip()  # the bug's EXTRA_MAKE, if any
+    for name, body, mode in (("oracle", ORACLE, 0o755), ("build.sh", BUILD.format(extra=extra_make), 0o755)):
+        with open(os.path.join(fa, name), "w") as fh:
+            fh.write(body)
+        os.chmod(os.path.join(fa, name), mode)
+    shutil.copy(os.path.join(HERE, "in-container.sh"), os.path.join(fa, "in-container.sh"))
+
+    print(f"[fangelix] {bug.name}: files {files} (from {'--file' if args.file else args.fl}), "
+          f"{len(tests)} tests, ≤{args.time_limit}s, defects {' '.join(args.defect)}", flush=True)
+    t0 = time.time()
+    cmd = ["docker", "run", "--rm", "--network", "none", "--ulimit", "nofile=65536:65536",
+           "-v", f"{fa}:/fa", "-e", f"TIME_LIMIT={args.time_limit}", "-e", f"TEST_TIMEOUT={args.test_timeout}",
+           "-e", f"DEFECTS={' '.join(args.defect)}", "-e", f"ALL_FILES={int(args.all_files)}",
+           "-e", f"ANGELIX_EXTRA={' '.join(extra)}", "-e", f"HOST_UID={os.getuid()}", "-e", f"HOST_GID={os.getgid()}",
+           image, "bash", "/fa/in-container.sh"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=args.time_limit + 3600)
+    secs = int(time.time() - t0)
+    pre = dict(l.split()[:2] for l in open(os.path.join(fa, "pre.txt")) if len(l.split()) == 2) \
+        if os.path.exists(os.path.join(fa, "pre.txt")) else {}
+
+    # ---- candidates
+    runs = []
+    rp = os.path.join(fa, "runs.txt")
+    for line in (open(rp) if os.path.exists(rp) else []):
+        n, f, st, dt = line.split()
+        run = {"file": f, "status": st, "seconds": int(dt), "candidate": None}
+        wd = os.path.join(fa, "work", n)
+        pats = sorted(p for p in os.listdir(wd) if p.endswith(".patch")) if os.path.isdir(wd) else []
+        if pats:
+            raw = open(os.path.join(wd, pats[0])).read()
+            run["angelix_patch"] = raw
+            stem = os.path.splitext(os.path.basename(f))[0]
+            out = os.path.join(out_dir, "candidates", f"{n}-{stem}.patch")
+            with tempfile.TemporaryDirectory() as tmp:
+                w = os.path.join(tmp, "wd")
+                shutil.copytree(args.workdir, w, symlinks=True)
+                ap_ = subprocess.run(["patch", "-p1", "--no-backup-if-mismatch", "-f"], input=raw, text=True,
+                                     cwd=os.path.join(w, tree), capture_output=True)
+                if ap_.returncode == 0:
+                    diff = sb.sh([sb.CVEBENCH, "diff", "-w", w]).stdout
+                    if diff.strip():
+                        open(out, "w").write(diff)
+                        run["candidate"] = os.path.relpath(out, out_dir)
+                else:
+                    run["note"] = "patch does not apply: " + (ap_.stdout + ap_.stderr)[-300:]
+        for name in ("angelix.log", "statistics.json"):
+            p = os.path.join(wd, name)
+            if os.path.exists(p):
+                os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
+                shutil.copy(p, os.path.join(out_dir, "logs", f"{n}-{os.path.basename(f)}.{name}"))
+        runs.append(run)
+    summary = {
+        "image": image, "fl": None if args.file else args.fl, "formula": formula, "files": files,
+        "time_limit": args.time_limit, "defects": args.defect, "angelix_extra": extra,
+        "tests": {t: pre.get(t) for t, _ in tests},
+        "excluded_tests": sorted(t for t, o in pre.items() if o == "fail" and t not in trig_ids),
+        "container_exit": r.returncode, "runs": runs, "seconds": secs,
+    }
+    json.dump(summary, open(os.path.join(out_dir, "fangelix.json"), "w"), indent=2)
+    if r.returncode != 0:
+        tail = (r.stdout + r.stderr)[-1500:]
+        print(f"[fangelix] container exited {r.returncode}: {tail}", flush=True)
+    if not args.keep:
+        shutil.rmtree(os.path.join(fa, "src"), ignore_errors=True)
+        shutil.rmtree(os.path.join(fa, "work"), ignore_errors=True)
+    ok = [x for x in runs if x["candidate"]]
+    print(f"[fangelix] {bug.name}: " + ", ".join(f"{x['file']} {x['status']} ({x['seconds']}s)" for x in runs)
+          + f" -> {len(ok)} candidate(s) in {secs}s", flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""run — cvebench APR adapter for MagentLess, the multi-language Agentless of Multi-SWE-bench.
+
+    run <results-dir> <workdir> -o <out-dir> [--sets 2] [--samples 2] [--model M] [--base-url URL]
+        [--embed-url URL] [--embed-model M | --no-retrieval] [--min-tokens 16384]
+        [--keep-comments] [--no-redact] [--fresh]
+
+Agentless (Xia, Deng, Dunn, Zhang; FSE 2025) is a fixed, agent-free pipeline:
+hierarchical localization (files -> functions/variables -> edit lines), sampled repair
+as search/replace edits, then patch selection. MagentLess (Zan et al., Multi-SWE-bench,
+NeurIPS 2025 D&B) ports it to C, C++, Go, Java, Rust, TS/JS. This adapter runs upstream's
+pipeline (script/run.sh @ MAGENTLESS_COMMIT) unchanged, stage by stage, through mlrun.py:
+
+  localization1.1  file level: the LLM names <= 5 files from the repository structure
+  localization1.2  file level: folders irrelevant to the problem     } embedding retrieval;
+  localization1.3  embedding retrieval over the remaining files      } --no-retrieval skips
+  localization1.4  combine the two file lists (top 3)                } these three
+  localization2.1  related elements (functions, variables) in the top-3 files
+  localization3.1  edit lines, --sets samples at temperature 0.8
+  localization3.2  merge -> one location set per sample
+  repair           per location set: --samples patches (greedy + sampled), CoT, SEARCH/REPLACE
+  selection3.1     rerank.py --deduplicate: majority vote over the normalized patches
+                   (upstream's run.sh default; its regression/reproduction-test selection
+                   stages are commented out there, and the harness validates every
+                   candidate anyway)
+
+Inputs, in upstream's formats, under <out-dir>/ws/:
+  data/<lang>/cvebench.jsonl   one instance; problem statement = the bug report every
+                               cvebench agent gets (aprsandbox.bug_report: the failing test,
+                               comments stripped, CVE ids redacted, + its failure output,
+                               obtained by running it once in the bug's buggy image)
+  structure/<id>.json          upstream create_structure() of the buggy source tree
+                               (PROJECT_FILE_LOC; upstream would clone the repo instead)
+Outputs: every distinct non-empty sample patch, re-exported with `cvebench diff`, is a
+candidate (candidates/s<set>_<k>.patch); magentless.json records the localized files,
+which samples produced each candidate and which one upstream's selection picked.
+
+LLM endpoint: OPENAI_BASE_URL, OPENAI_API_KEY, MAGENTLESS_MODEL (or --model; default the
+first model the server lists). Embeddings: --embed-url (default http://127.0.0.1:11434/v1,
+Ollama) serving --embed-model (default nomic-embed-text). Substitutions in mlrun.py: an
+output-token floor (--min-tokens) for reasoning models and a generic embeddings client.
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+VENV_PY = os.path.join(HERE, ".venv", "bin", "python")
+UP = os.path.join(HERE, "upstream")
+sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
+import aprsandbox as sb  # noqa: E402
+
+LANG_OF = {"haproxy": "c", "kubernetes": "go"}
+
+
+def trigger_failure(bug, sbx):
+    """Run the failing test once in the buggy image (no network; the answer hidden as for agents)."""
+    r = sb.sh(["docker", "run", "--rm", *sb.DOCKER_ARGS, "-v", f"{sbx}:/cvebench:ro", "-w", bug.src,
+               "-e", "PATH=/cvebench/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+               bug.image, "bash", "-c", sb.setup_cmd(bug.src) + " && cvebench-test trigger"], timeout=900)
+    return (r.stdout + r.stderr).strip()
+
+
+def nltk_data_dir():
+    """A private (0700) NLTK data dir for llama-index (NLTK_DATA): NLTK refuses data dirs others can write."""
+    d = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "cvebench-magentless")
+    os.makedirs(d, exist_ok=True)
+    os.chmod(d, 0o700)
+    return os.path.join(d, "nltk")
+
+
+def stage(name, script, argv, env, ws, logs):
+    t0 = time.time()
+    log = os.path.join(logs, f"{name}.log")
+    print(f"[magentless] {name} ...", flush=True)
+    with open(log, "w") as fh:
+        # umask 077: llama-index fetches NLTK data into its cache dir, and NLTK refuses
+        # group/world-writable data directories
+        r = subprocess.run([VENV_PY, os.path.join(HERE, "mlrun.py"), os.path.join(UP, script), *argv],
+                           cwd=ws, env=env, stdout=fh, stderr=subprocess.STDOUT, preexec_fn=lambda: os.umask(0o077))
+    if r.returncode != 0:
+        raise SystemExit(f"[magentless] stage {name} failed (exit {r.returncode}); see {log}")
+    return int(time.time() - t0)
+
+
+def export(workdir, tree, model_patch, out_patch):
+    """Apply an upstream patch (git diff, paths relative to the source root) to a copy of
+    <workdir> and export it with `cvebench diff`; returns (ok, diff or error)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wd = os.path.join(tmp, "wd")
+        shutil.copytree(workdir, wd, symlinks=True)
+        r = subprocess.run(["patch", "-p1", "--no-backup-if-mismatch", "-f"], input=model_patch, text=True,
+                           cwd=os.path.join(wd, tree), capture_output=True)
+        if r.returncode != 0:
+            return False, (r.stdout + r.stderr).strip()
+        diff = sb.sh([sb.CVEBENCH, "diff", "-w", wd]).stdout
+    if diff.strip():
+        with open(out_patch, "w") as fh:
+            fh.write(diff)
+    return True, diff
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("results")
+    ap.add_argument("workdir")
+    ap.add_argument("-o", "--out-dir", required=True)
+    ap.add_argument("--sets", type=int, default=2, help="edit-location samples (upstream NUM_SETS)")
+    ap.add_argument("--samples", type=int, default=2, help="patches per location set (upstream NUM_SAMPLES_PER_SET)")
+    ap.add_argument("--model", default=os.getenv("MAGENTLESS_MODEL"))
+    ap.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL"))
+    ap.add_argument("--embed-url", default=os.getenv("OPENAI_EMBED_URL", "http://127.0.0.1:11434/v1"))
+    ap.add_argument("--embed-model", default=os.getenv("MAGENTLESS_EMBED_MODEL", "nomic-embed-text"))
+    ap.add_argument("--no-retrieval", action="store_true",
+                    help="skip the embedding-retrieval stages (file list = the LLM's file-level answer)")
+    ap.add_argument("--min-tokens", type=int, default=16384, help="output-token floor per request (mlrun.py)")
+    ap.add_argument("--keep-comments", action="store_true", help="keep the trigger test's # comments")
+    ap.add_argument("--no-redact", action="store_true", help="show CVE identifiers in the test")
+    ap.add_argument("--fresh", action="store_true", help="discard an earlier run's stage outputs")
+    args = ap.parse_args()
+
+    if not os.access(VENV_PY, os.X_OK) or not os.path.isdir(os.path.join(UP, "agentless")):
+        raise SystemExit(f"magentless not prepared — run {HERE}/prepare.sh (cvebench prepare -t magentless)")
+    if not args.base_url:
+        raise SystemExit("no LLM endpoint: set OPENAI_BASE_URL (and OPENAI_API_KEY)")
+    model = args.model or sb.default_model(args.base_url, prefix="")
+
+    bug = sb.Bug(args.workdir)
+    if bug.pid not in ("haproxy",):
+        raise SystemExit(f"magentless: {bug.pid} not supported yet (the bug report comes from the HAProxy APR sandbox)")
+    lang = LANG_OF[bug.pid]
+    bug.ensure_image("magentless")
+    out_dir = os.path.abspath(args.out_dir)
+    ws = os.path.join(out_dir, "ws")
+    if args.fresh and os.path.isdir(ws):
+        shutil.rmtree(ws)
+    logs = os.path.join(ws, "logs")
+    for d in ("candidates",):
+        os.makedirs(os.path.join(out_dir, d), exist_ok=True)
+    for d in (logs, os.path.join(ws, "data", lang), os.path.join(ws, "structure")):
+        os.makedirs(d, exist_ok=True)
+    tree = os.path.basename(bug.src)  # <pid>-<version>, the source root inside <workdir>
+    iid = f"{bug.pid}__{bug.pid}-{bug.bid}"
+
+    # ---- problem statement: the same bug report the agents get
+    task_p = os.path.join(ws, "task.txt")
+    if not os.path.exists(task_p):
+        sbx = os.path.join(out_dir, "sandbox")
+        trig = sb.write_helpers(bug, sbx, keep_comments=args.keep_comments, redact=not args.no_redact)
+        task = sb.bug_report(trig, trigger_failure(bug, sbx))
+        open(task_p, "w").write(task)
+    task = open(task_p).read()
+    title = f"{bug.pid}: a regression test fails"
+    inst = {"org": bug.pid, "repo": bug.pid, "instance_id": iid, "base": {"sha": bug.version},
+            "resolved_issues": [{"title": title, "body": task}]}
+    with open(os.path.join(ws, "data", lang, "cvebench.jsonl"), "w") as fh:
+        fh.write(json.dumps(inst) + "\n")
+
+    # ---- repository structure of the buggy tree (upstream's parser)
+    struct_p = os.path.join(ws, "structure", f"{iid}.json")
+    if not os.path.exists(struct_p):
+        code = ("import json, sys; from get_repo_structure.get_repo_structure import create_structure; "
+                "s = create_structure(sys.argv[1]); "
+                "json.dump({'repo': sys.argv[2], 'base_commit': sys.argv[3], 'structure': s, 'instance_id': sys.argv[4]}, "
+                "open(sys.argv[5], 'w'))")
+        r = subprocess.run([VENV_PY, "-c", code, os.path.join(args.workdir, tree), f"{bug.pid}/{bug.pid}",
+                            bug.version, iid, struct_p], cwd=UP, env={**os.environ, "SWEBENCH_LANG": lang},
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SystemExit(f"structure extraction failed: {r.stderr[-2000:]}")
+
+    env = {**os.environ, "MAGENTLESS_ROOT": UP, "PYTHONPATH": UP, "SWEBENCH_LANG": lang,
+           "PROJECT_FILE_LOC": os.path.join(ws, "structure"), "OPENAI_BASE_URL": args.base_url,
+           "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", "none"), "OPENAI_MODEL": model,
+           "OPENAI_EMBED_URL": args.embed_url, "MAGENTLESS_EMBED_MODEL": args.embed_model,
+           "MAGENTLESS_MIN_TOKENS": str(args.min_tokens), "TOKENIZERS_PARALLELISM": "false",
+           "NLTK_DATA": nltk_data_dir()}
+    common = ["--num_threads", "1", "--dataset", "local_json", "--split", "test"]
+    R = "results/cvebench"
+    secs = {}
+    t_all = time.time()
+    print(f"[magentless] {bug.name}: model {model}, {args.sets} location sets x {args.samples} samples, "
+          f"retrieval {'off' if args.no_retrieval else args.embed_model}", flush=True)
+
+    # ---- localization (script/localization*.sh)
+    secs["file_level"] = stage("localization1.1", "agentless/fl/localize.py",
+                               ["--file_level", "--output_folder", f"{R}/file_level", *common, "--skip_existing"], env, ws, logs)
+    if args.no_retrieval:
+        start = f"{R}/file_level/loc_outputs.jsonl"
+    else:
+        secs["file_level_irrelevant"] = stage(
+            "localization1.2", "agentless/fl/localize.py",
+            ["--file_level", "--irrelevant", "--output_folder", f"{R}/file_level_irrelevant", *common, "--skip_existing"],
+            env, ws, logs)
+        if not os.path.exists(os.path.join(ws, R, "retrievel_embedding", "retrieve_locs.jsonl")):
+            secs["retrieval"] = stage(
+                "localization1.3", "agentless/fl/retrieve.py",
+                ["--index_type", "simple", "--filter_type", "given_files",
+                 "--filter_file", f"{R}/file_level_irrelevant/loc_outputs.jsonl",
+                 "--output_folder", f"{R}/retrievel_embedding", "--persist_dir", "embedding/swe-bench_simple", *common],
+                env, ws, logs)
+        secs["combine"] = stage(
+            "localization1.4", "agentless/fl/combine.py",
+            ["--retrieval_loc_file", f"{R}/retrievel_embedding/retrieve_locs.jsonl",
+             "--model_loc_file", f"{R}/file_level/loc_outputs.jsonl", "--top_n", "3",
+             "--output_folder", f"{R}/file_level_combined"], env, ws, logs)
+        start = f"{R}/file_level_combined/combined_locs.jsonl"
+    secs["related_level"] = stage(
+        "localization2.1", "agentless/fl/localize.py",
+        ["--related_level", "--output_folder", f"{R}/related_elements", "--top_n", "3", "--compress_assign",
+         "--compress", "--start_file", start, *common, "--skip_existing"], env, ws, logs)
+    secs["line_level"] = stage(
+        "localization3.1", "agentless/fl/localize.py",
+        ["--fine_grain_line_level", "--output_folder", f"{R}/edit_location_samples", "--top_n", "3", "--compress",
+         "--temperature", "0.8", "--num_samples", str(args.sets), "--start_file", f"{R}/related_elements/loc_outputs.jsonl",
+         *common, "--skip_existing"], env, ws, logs)
+    secs["merge"] = stage(
+        "localization3.2", "agentless/fl/localize.py",
+        ["--merge", "--output_folder", f"{R}/edit_location_individual", "--top_n", "3", "--num_samples", str(args.sets),
+         "--start_file", f"{R}/edit_location_samples/loc_outputs.jsonl", "--dataset", "local_json"], env, ws, logs)
+
+    # ---- repair (script/repair.sh)
+    for i in range(1, args.sets + 1):
+        folder = f"{R}/repair_sample_{i}"
+        if all(os.path.exists(os.path.join(ws, folder, f"output_{k}_processed.jsonl")) for k in range(args.samples)):
+            continue
+        if os.path.isdir(os.path.join(ws, folder)):
+            shutil.rmtree(os.path.join(ws, folder))
+        secs[f"repair_{i}"] = stage(
+            f"repair{i}", "agentless/repair/repair.py",
+            ["--loc_file", f"{R}/edit_location_individual/loc_merged_{i - 1}-{i - 1}_outputs.jsonl",
+             "--output_folder", folder, "--loc_interval", "--top_n", "3", "--context_window", "10",
+             "--max_samples", str(args.samples), "--cot", "--diff_format", "--gen_and_process", *common],
+            env, ws, logs)
+
+    # ---- selection (script/selection3.1.sh)
+    folders = ",".join(f"{R}/repair_sample_{i}" for i in range(1, args.sets + 1))
+    secs["selection"] = stage("selection3.1", "agentless/repair/rerank.py",
+                              ["--patch_folder", folders, "--num_samples", str(args.sets * args.samples),
+                               "--deduplicate", "--output_file", f"{R}/all_preds.jsonl"], env, ws, logs)
+
+    # ---- candidates
+    def first(path, key):
+        p = os.path.join(ws, path)
+        if not os.path.exists(p):
+            return None
+        for line in open(p):
+            d = json.loads(line)
+            if d.get("instance_id") == iid:
+                return d.get(key)
+        return None
+
+    selected = (first(f"{R}/all_preds.jsonl", "model_patch") or "").strip()
+    cands, by_diff = {}, {}
+    for f in os.listdir(os.path.join(out_dir, "candidates")):
+        os.remove(os.path.join(out_dir, "candidates", f))
+    for i in range(1, args.sets + 1):
+        for k in range(args.samples):
+            sid = f"s{i}_{k}"
+            mp = first(f"{R}/repair_sample_{i}/output_{k}_processed.jsonl", "model_patch") or ""
+            if not mp.strip():
+                cands[sid] = {"candidate": None, "note": "no patch (empty, unparsable or not applicable edit)"}
+                continue
+            ok, diff = export(args.workdir, tree, mp, os.path.join(out_dir, "candidates", f"{sid}.patch"))
+            if not ok:
+                cands[sid] = {"candidate": None, "note": f"upstream patch does not apply: {diff[:300]}"}
+                os.path.exists(os.path.join(out_dir, "candidates", f"{sid}.patch")) and os.remove(
+                    os.path.join(out_dir, "candidates", f"{sid}.patch"))
+                continue
+            if diff in by_diff:  # identical to an earlier sample: one candidate
+                os.remove(os.path.join(out_dir, "candidates", f"{sid}.patch"))
+                cands[sid] = {"candidate": by_diff[diff], "note": "same patch as an earlier sample"}
+            else:
+                by_diff[diff] = f"candidates/{sid}.patch"
+                cands[sid] = {"candidate": by_diff[diff], "patch_lines": sb.patch_lines(diff)}
+            cands[sid]["selected"] = bool(selected) and mp.strip() == selected
+    summary = {
+        "model": model, "sets": args.sets, "samples": args.samples,
+        "retrieval": None if args.no_retrieval else {"embed_url": args.embed_url, "embed_model": args.embed_model},
+        "min_tokens": args.min_tokens,
+        "found_files": first(f"{R}/file_level/loc_outputs.jsonl", "found_files"),
+        "combined_files": None if args.no_retrieval else first(f"{R}/file_level_combined/combined_locs.jsonl", "found_files"),
+        "related_locs": first(f"{R}/related_elements/loc_outputs.jsonl", "found_related_locs"),
+        "samples_out": cands,
+        "selected": next((c["candidate"] for c in cands.values() if c.get("selected")), None),
+        "stage_seconds": secs, "seconds": int(time.time() - t_all),
+    }
+    json.dump(summary, open(os.path.join(out_dir, "magentless.json"), "w"), indent=2)
+    n = len(by_diff)
+    print(f"[magentless] {bug.name}: {n} distinct candidate(s) from {args.sets * args.samples} samples; "
+          f"selected {summary['selected']} ({summary['seconds']}s)", flush=True)
+
+
+if __name__ == "__main__":
+    main()

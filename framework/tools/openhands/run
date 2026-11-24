@@ -17,7 +17,8 @@ Pipeline, per run k = 1..R
      copied to a fresh host directory T (mtimes kept, so rebuilds stay incremental)
      and bind-mounted at the same path T in a sandbox container of that image
      (--network none). As root, the sandbox setup deletes the upstream fix patch left
-     by the image build and the CHANGELOG (aprsandbox.setup_cmd).
+     by the image build, and the CHANGELOG and patch backups *.orig / *.rej of both the shared
+     tree and the image's own /build tree (aprsandbox.setup_cmd).
   2. OpenHands' default CodeAct agent (system prompt with cli_mode, tools terminal +
      file_editor + task_tracker, LLM-summarizing condenser as in OpenHands' SWE-bench
      evaluation) runs on the host with workspace T:
@@ -202,7 +203,7 @@ def main():
                  "-v", f"{tree}:{tree}", "-v", f"{sbx}:/cvebench:ro", "-w", tree, *sandbox_env(tree),
                  bug.image, "sleep", f"{args.time_limit + 900}s"],
                 capture_output=True, text=True, check=True).stdout.strip()
-            r = sb.sh(["docker", "exec", cid, "bash", "-c", sb.setup_cmd(tree)])
+            r = sb.sh(["docker", "exec", cid, "bash", "-c", sb.setup_cmd(tree, also=[bug.src])])
             if r.returncode != 0:
                 raise SystemExit(f"sandbox setup failed: {r.stdout}{r.stderr}")
             failure = sb.sh(["docker", "exec", "--user", uid, *sandbox_env(tree), cid, "bash", "-c",

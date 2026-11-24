@@ -40,9 +40,12 @@ framework/
 │   ├── autofl/               # AutoFL (FSE 2024): LLM agent with code-navigation tools, ported to C and Go
 │   ├── cosmosfl/             # COSMosFL (LLM4Code 2025): ensemble of small models running AutoFL, votes combined
 │   ├── miniswe/              # mini-swe-agent (2025): LLM agent that edits/tests in a sandbox of the buggy image
+│   ├── liveswe/              # Live-SWE-agent (2025): mini-swe-agent that writes its own tools on the fly
+│   ├── magentless/           # MagentLess (Agentless, FSE 2025, multi-language): agent-free localize -> repair -> select
 │   ├── openhands/            # OpenHands (ICLR 2025): CodeAct agent (terminal + file editor) on a sandboxed tree
 │   ├── darjeeling/           # Darjeeling: GenProg-style search-based repair (Kaskara/clang statement edits)
 │   ├── looprepair/           # LoopRepair (ICSE 2026): location-aware, trace-guided iterative LLM repair
+│   ├── fangelix/             # FAngelix (IST 2022, Angelix extension): semantics-based condition repair (Docker image)
 │   └── oracle/               # reference APR adapter (upstream fix + empty patch)
 ├── projects/haproxy/
 │   ├── project.sh            # project module: tarball fetch, gcov build, vtest runners, kind coverage
@@ -126,6 +129,12 @@ $cvebench apr      -p haproxy -b 3 -t oracle             # adapter-driven: check
 $cvebench prepare  -t miniswe                            # one-off: venv with mini-swe-agent (+ litellm)
 OPENAI_BASE_URL=http://127.0.0.1:8080/v1 OPENAI_API_KEY=none \
 $cvebench apr      -p haproxy -b 3 -t miniswe -- --runs 3 # LLM agent repair in a sandboxed buggy image
+$cvebench prepare  -t liveswe                            # one-off: reuses the miniswe venv
+OPENAI_BASE_URL=http://127.0.0.1:8080/v1 OPENAI_API_KEY=none \
+$cvebench apr      -p haproxy -b 3 -t liveswe -- --runs 3 # same sandbox; the agent builds its own tools
+$cvebench prepare  -t magentless                         # one-off: venv + upstream MagentLess (Agentless port)
+OPENAI_BASE_URL=http://127.0.0.1:8080/v1 OPENAI_API_KEY=none \
+$cvebench apr      -p haproxy -b 3 -t magentless          # localize -> sample repairs -> majority vote (embeddings: Ollama)
 $cvebench prepare  -t openhands                          # one-off: venv with the OpenHands SDK + tools
 LLM_BASE_URL=http://127.0.0.1:8080/v1 LLM_API_KEY=none \
 $cvebench apr      -p haproxy -b 3 -t openhands          # OpenHands CodeAct agent, same sandbox
@@ -134,6 +143,8 @@ $cvebench apr      -p haproxy -b 2 -t darjeeling -- --time-limit 60   # GenProg-
 $cvebench prepare  -t looprepair                         # one-off: venv + upstream LoopRepair (LLM stage) + C grammar
 OPENAI_BASE_URL=http://127.0.0.1:8080/v1 OPENAI_API_KEY=none \
 $cvebench apr      -p haproxy -b 3 -t looprepair -- --fl autofl   # iterative LLM repair from an FL ranking
+$cvebench prepare  -t fangelix                           # one-off: pulls the FAngelix image (~35 GB) + adds VTest
+$cvebench apr      -p haproxy -b 2 -t fangelix -- --time-limit 3600  # condition synthesis in the top SBFL files
 $cvebench summary                                        # FL table + APR table
 ```
 
@@ -142,7 +153,7 @@ $cvebench summary                                        # FL table + APR table
 The tool contract (adapter layout, `cvebench` verbs as an API, file schemas,
 validation semantics, portability rules) is specified in
 **[docs/INTEGRATION.md](docs/INTEGRATION.md)**. Reference adapters:
-`framework/tools/flitsr` (FL), `framework/tools/oracle`, `framework/tools/miniswe`, `framework/tools/openhands`, `framework/tools/darjeeling` and `framework/tools/looprepair` (APR).
+`framework/tools/flitsr` (FL), `framework/tools/oracle`, `framework/tools/miniswe`, `framework/tools/liveswe`, `framework/tools/magentless`, `framework/tools/fangelix`, `framework/tools/openhands`, `framework/tools/darjeeling` and `framework/tools/looprepair` (APR).
 
 ## Bugs
 

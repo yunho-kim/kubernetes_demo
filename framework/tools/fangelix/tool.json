@@ -1,0 +1,8 @@
+{
+  "name": "fangelix",
+  "kind": "apr",
+  "description": "FAngelix (Angelix extension, MCMC-guided angelic-value search instead of KLEE): semantics-based repair of side-effect-free if/loop conditions in one C file per run — instrument, trace-based localization, angelic values that make the failing tests pass, Z3/MaxSMT synthesis of a replacement condition. Runs unchanged in its Docker image (+ VTest); files to repair from an FL ranking (--fl, default sbfl:ochiai); tests = trigger + relevant reg-tests that pass on the buggy build; HAProxy built with one thread for Angelix's trace runtime",
+  "reference": "J. Yi, E. Ismayilzada. Speeding up constraint-based program repair using a search-based technique. Information and Software Technology 146:106865, 2022. Angelix: S. Mechtaev, J. Yi, A. Roychoudhury. Angelix: Scalable Multiline Program Patch Synthesis via Symbolic Analysis. ICSE 2016.",
+  "url": "https://github.com/jyi/fangelix",
+  "granularity": "patch"
+}
