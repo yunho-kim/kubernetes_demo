@@ -16,10 +16,13 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "lib"))
+import venvcheck  # noqa: E402
 MINISWE_RUN = os.path.join(HERE, "..", "miniswe", "run")
 args = sys.argv[1:]
 if not any(a == "--config" or a.startswith("--config=") for a in args):
     args += ["--config", os.path.join(HERE, "config.yaml")]
 if not any(a == "--tool" or a.startswith("--tool=") for a in args):
     args += ["--tool", "liveswe"]
+venvcheck.require(HERE)                     # .venv = the miniswe adapter's venv (cvebench prepare -t liveswe)
 os.execv(sys.executable, [sys.executable, os.path.abspath(MINISWE_RUN)] + args)

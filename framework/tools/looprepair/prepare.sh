@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # prepare.sh — set up the LoopRepair APR adapter.
 #
-#   framework/tools/looprepair/.venv/      python 3.9–3.11 + upstream's LLM-stage requirements
+#   framework/tools/looprepair/.venv/      CPython (PYTHON_VERSION in versions.env; upstream needs
+#                                          3.9–3.11) + upstream's LLM-stage requirements,
+#                                          exactly requirements.lock
 #   framework/tools/looprepair/upstream/   Fino2020/LoopRepair at the commit in versions.env
 #   upstream/src/tree-sitter/build/my-languages.so
 #                                          upstream's tree-sitter C grammar (vendored source),
@@ -14,31 +16,15 @@
 #   the first model the server lists)
 # and docker + the bug's buggy image (cvebench compile) for building and testing candidates.
 #
-# Requirements: python3.9–3.11 (or uv), git, docker, network.
+# Requirements: git, docker, network.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/versions.env"
+source "$HERE/../../lib/pyenv.sh"
 VENV="$HERE/.venv"; UP="$HERE/upstream"
 
 command -v git >/dev/null || { echo "[x] git not found" >&2; exit 1; }
-if [[ ! -x "$VENV/bin/python" ]]; then
-  PY=""
-  for c in "${PYTHON:-}" python3.11 python3.10 python3.9; do
-    [[ -n "$c" ]] && command -v "$c" >/dev/null && PY="$c" && break
-  done
-  if [[ -n "$PY" ]]; then
-    echo "[+] creating venv $VENV with $PY ($("$PY" --version))"
-    "$PY" -m venv "$VENV" || { echo "[x] '$PY -m venv' failed (apt install python3-venv)" >&2; exit 1; }
-    "$VENV/bin/python" -m pip install --quiet --upgrade pip
-  elif command -v uv >/dev/null; then
-    echo "[+] no python3.9–3.11 on PATH; creating venv with uv-managed Python 3.11"
-    uv venv --quiet --python 3.11 --seed "$VENV"
-  else
-    echo "[x] need python3.9–3.11 (or uv: https://docs.astral.sh/uv/)" >&2; exit 1
-  fi
-fi
-echo "[+] installing $(grep -v '^#' "$HERE/requirements.txt" | tr '\n' ' ')"
-"$VENV/bin/python" -m pip install --quiet -r "$HERE/requirements.txt"
+pyenv_ensure "$HERE"
 
 if [[ ! -d "$UP/.git" ]]; then
   echo "[+] cloning LoopRepair @ ${LOOPREPAIR_COMMIT:0:8}"

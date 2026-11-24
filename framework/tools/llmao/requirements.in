@@ -1,0 +1,11 @@
+# LLMAO runtime. torch from PyPI (no special index) bundles CUDA 13: the nvidia-* / cuda-*
+# packages in the lock; a GPU needs an NVIDIA driver for CUDA 13, CPU-only machines work too
+# (slowly). transformers is pinned to a 4.x release: LLMAO ships its own modeling_codegen.py
+# that imports transformers internals removed in 5.x.
+# Direct dependencies only; the full tree with hashes is requirements.lock (framework/lib/pyenv.sh lock).
+torch==2.13.0
+transformers==4.46.3
+accelerate==1.14.0
+numpy==2.5.2
+pandas==3.0.5
+sentencepiece==0.2.2

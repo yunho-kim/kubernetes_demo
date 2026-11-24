@@ -1,2 +1,3 @@
 # mini-swe-agent (SWE-agent team, 2025): the agent loop, litellm model clients, docker environment.
+# Direct dependencies only; the full tree with hashes is requirements.lock (framework/lib/pyenv.sh lock).
 mini-swe-agent==2.4.6

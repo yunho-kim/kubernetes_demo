@@ -151,18 +151,38 @@ and `patches/<bid>.fix.patch`.
 framework/tools/<tool>/
 ├── tool.json          # {"name","kind":"fl","description","reference","url","granularity":"line|function|file"}
 ├── prepare.sh         # optional; one-off setup on a fresh machine
-├── requirements.txt   # optional; pinned Python deps installed by prepare.sh
+├── versions.env       # pins: upstream commits/versions; PYTHON_VERSION=X.Y.Z for a Python tool
+├── requirements.in    # Python tool: direct dependencies (human-maintained, pinned ==)
+├── requirements.lock  # Python tool: the full tree with hashes (framework/lib/pyenv.sh lock), committed
 ├── run                # required; executable
-└── .venv/             # created by prepare.sh, git-ignored
+└── .venv/             # created by prepare.sh, git-ignored (.venv/.cvebench-stamp: what it was built from)
 ```
 
 ### 4.2 `prepare.sh`
 
 Installs everything the tool needs **into the tool directory** (a venv, a
 downloaded model, a compiled binary). It must not assume anything about the
-host beyond `python3`, `bash`, `git`, network access, and must be safe to run
-twice. Nothing is installed system-wide. If your tool has no dependencies,
-omit the file (the harness reports it as `ready`).
+host beyond the README's host requirements (`bash`, `curl`, `git`, `docker`,
+network access) and must be safe to run twice. Nothing is installed
+system-wide. If your tool has no dependencies, omit the file (the harness
+reports it as `ready`).
+
+A Python tool builds its venv with the shared helper — never with the host's
+`python3`/`pip` (rule in 6):
+
+```bash
+source "$HERE/../../lib/pyenv.sh"
+pyenv_ensure "$HERE"     # $HERE/.venv = CPython $PYTHON_VERSION + exactly requirements.lock
+```
+
+`pyenv_ensure` finds or downloads uv, installs the CPython pinned in
+`versions.env` into `framework/.python/`, (re)creates `.venv` when it is missing
+or on another interpreter, runs `uv pip sync requirements.lock` (adds what is
+missing, removes what is not locked) and writes `.venv/.cvebench-stamp`. After
+editing `requirements.in` (or `PYTHON_VERSION`), re-resolve and commit the lock:
+`framework/lib/pyenv.sh lock framework/tools/<tool>` (existing pins are kept
+unless you pass `--upgrade` / `--upgrade-package <name>`). Keep the tool's own
+post-install checks (imports, a `--selftest`) after `pyenv_ensure`.
 
 ### 4.3 `run`
 
@@ -185,6 +205,12 @@ run <results-dir> [-o <out-dir>] [--metric <name>]... [tool-specific args]
   host-installed third-party packages: call your venv explicitly
   (`$HERE/.venv/bin/python`, `$HERE/.venv/bin/<tool>`), keep the `run`
   script itself standard-library Python or bash.
+* Before touching the venv, check it with `framework/lib/venvcheck.py`
+  (stdlib): `venvcheck.require(HERE)` exits with "venv stale/broken — run
+  cvebench prepare -t <tool>" instead of a `ModuleNotFoundError` deep inside the
+  tool, and sets `PYTHONNOUSERSITE=1` for everything started from `run`;
+  `venvcheck.reexec(HERE, __file__)` does the same and re-runs the script inside
+  the venv (miniswe, openhands, looprepair).
 * Exit non-zero on failure, with a message on stderr.
 
 ### 4.4 Output: `ranking.json`
@@ -272,11 +298,12 @@ Reference implementations:
 * `framework/tools/llmao/` — a **model-based, test-free technique**: `run`
   (stdlib) picks the files to score from the spectrum and checks out the buggy
   source, then delegates to `llmao_infer.py` inside the tool's venv (torch,
-  transformers pinned in `requirements.txt`; upstream LLMAO cloned at a pinned
-  commit by `prepare.sh`, Hugging Face cache kept under `.venv/`). It shows how
-  to wrap a GPU/ML tool without touching the host Python: `prepare.sh` picks a
-  Python 3.10–3.13 interpreter or a `uv`-managed one, and `run` never imports
-  third-party packages itself.
+  transformers pinned in `requirements.in` / `requirements.lock`; upstream LLMAO
+  cloned at a pinned commit by `prepare.sh`, Hugging Face cache kept under
+  `.venv/`, carried over when `pyenv.sh` rebuilds the venv). It shows how to wrap
+  a GPU/ML tool without touching the host Python: the venv runs the CPython
+  pinned in `versions.env` (3.12.12: the tokenizers release transformers 4.46
+  needs has no 3.14 wheels), and `run` never imports third-party packages itself.
 * `framework/tools/autofl/` — an **LLM agent that needs an API**: the upstream
   Java protocol (four code-navigation functions, R repetitions, vote scoring)
   is ported to C and Go with tree-sitter function indexes. The endpoint is configured
@@ -502,9 +529,28 @@ memorisation — report it as a threat to validity.
 
 ## 6. Portability rules (all tools)
 
-* **No host-specific dependencies.** Anything beyond `bash`, `python3`, `git`,
-  `docker` is installed by `prepare.sh` into `framework/tools/<tool>/`.
-  Pin versions (`requirements.txt`, git tags, checksums).
+* **No host-specific dependencies.** Anything beyond `bash`, `curl`, `git`,
+  `docker` (and a stdlib-only `python3` for the harness) is installed by
+  `prepare.sh` into `framework/tools/<tool>/`. Pin versions (`versions.env`,
+  `requirements.lock`, git commits, checksums).
+* **The benchmark owns the Python.** A Python tool never runs on the host's
+  Python, and nothing on the host chooses its packages: its venv is built by
+  `framework/lib/pyenv.sh` from a uv-managed CPython at the exact version in
+  `versions.env` (`PYTHON_VERSION=3.12.12`; python-build-standalone, installed
+  into the git-ignored `framework/.python/`, never into the user's uv store) and
+  the tool's committed `requirements.lock` (full dependency tree with hashes,
+  resolved from `requirements.in` for that Python and `x86_64-manylinux_2_28`,
+  installed with `uv pip sync` — exact, and uv reads no `pip.conf`). Git pins and
+  special indexes belong in `requirements.in`, so they end up in the lock; the
+  only host requirement is uv, which `pyenv.sh` downloads (pinned version and
+  sha256 in `framework/lib/pyenv.env`) into `framework/.uv/` when the host has
+  none. Tool Pythons run with `PYTHONNOUSERSITE=1`. `.venv/.cvebench-stamp`
+  records the interpreter version, the lock's sha256 and the uv version;
+  `cvebench tools` and `framework/lib/venvcheck.py` (called by each `run`)
+  report `stale` when the lock or `PYTHON_VERSION` changed and `broken` when the
+  interpreter no longer runs or is not the version the venv was built for.
+  Two tools may share a venv by linking `.venv` to another tool's (cosmosfl →
+  autofl, liveswe → miniswe); it is then checked against the owner's lock.
 * **No dedicated containers for the tool itself.** The harness already uses
   Docker for the software under test; tools run on the host. (Running an
   agent's commands in a container of the bug's own image — 5.7 — is fine.) A tool that needs

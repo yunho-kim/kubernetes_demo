@@ -40,9 +40,9 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-VENV_PY = os.path.join(HERE, ".venv", "bin", "python")
 sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
 import aprsandbox as sb  # noqa: E402
+import venvcheck  # noqa: E402
 
 
 def main():
@@ -73,10 +73,7 @@ def main():
                          "(e.g. selftest.cmds)")
     args = ap.parse_args()
 
-    if not os.access(VENV_PY, os.X_OK):
-        raise SystemExit(f"miniswe venv missing — run {HERE}/prepare.sh (cvebench prepare -t miniswe)")
-    if os.path.realpath(sys.prefix) != os.path.realpath(os.path.join(HERE, ".venv")):  # re-exec inside the venv
-        os.execv(VENV_PY, [VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
+    venvcheck.reexec(HERE, __file__)        # re-exec inside the venv (exits unless it is prepared)
 
     os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
     os.environ.setdefault("MSWEA_COST_TRACKING", "ignore_errors")

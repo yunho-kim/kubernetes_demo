@@ -54,6 +54,7 @@ DARJEELING = os.path.join(HERE, ".venv", "bin", "darjeeling")
 sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
 import aprsandbox as sb  # noqa: E402
 import flcommon as fl  # noqa: E402
+import venvcheck  # noqa: E402
 
 KASKARA_VOLUME = "kaskara-clang"
 LOG_CAP = 20 * 2 ** 20  # bytes of Darjeeling output kept in runs/run<k>/darjeeling.log (+ the tail)
@@ -223,8 +224,7 @@ def main():
     ap.add_argument("--fresh", action="store_true", help="redo runs that already have a log")
     args = ap.parse_args()
 
-    if not os.access(DARJEELING, os.X_OK):
-        raise SystemExit(f"darjeeling venv missing — run {HERE}/prepare.sh (cvebench prepare -t darjeeling)")
+    venvcheck.require(HERE)                 # exits unless the venv is prepared (cvebench prepare -t darjeeling)
     if not os.path.exists(os.path.join(args.results, "tests.json")):
         raise SystemExit("no coverage for this bug — run `cvebench coverage` first (Darjeeling's FL uses it)")
     if sb.sh(["docker", "volume", "inspect", KASKARA_VOLUME]).returncode != 0:

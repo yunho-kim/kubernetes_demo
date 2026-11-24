@@ -9,6 +9,7 @@ FW_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # .../framework
 REPO_ROOT="$(cd "$FW_ROOT/.." && pwd)"
 export PATH="$REPO_ROOT/bin:$PATH"                            # vendored kind + kubectl
 export KIND_CLUSTER="${KIND_CLUSTER:-cvebench}"
+export PYTHONNOUSERSITE=1                                     # no ~/.local site-packages in any Python we start
 KCTX="kind-${KIND_CLUSTER}"
 RESULTS_ROOT="$REPO_ROOT/results"
 

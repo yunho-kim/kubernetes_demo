@@ -1,0 +1,3 @@
+# FLITSR — https://pypi.org/project/flitsr/  (pulls numpy, scipy, bitarray, deprecated)
+# Direct dependencies only; the full tree with hashes is requirements.lock (framework/lib/pyenv.sh lock).
+flitsr==2.4.0

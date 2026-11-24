@@ -55,6 +55,7 @@ VENV_PY = os.path.join(HERE, ".venv", "bin", "python")
 UP = os.path.join(HERE, "upstream")
 sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
 import aprsandbox as sb  # noqa: E402
+import venvcheck  # noqa: E402
 
 LANG_OF = {"haproxy": "c", "kubernetes": "go"}
 
@@ -125,8 +126,9 @@ def main():
     ap.add_argument("--fresh", action="store_true", help="discard an earlier run's stage outputs")
     args = ap.parse_args()
 
-    if not os.access(VENV_PY, os.X_OK) or not os.path.isdir(os.path.join(UP, "agentless")):
+    if not os.path.isdir(os.path.join(UP, "agentless")):
         raise SystemExit(f"magentless not prepared — run {HERE}/prepare.sh (cvebench prepare -t magentless)")
+    venvcheck.require(HERE)                 # exits unless the venv is prepared (cvebench prepare -t magentless)
     if not args.base_url:
         raise SystemExit("no LLM endpoint: set OPENAI_BASE_URL (and OPENAI_API_KEY)")
     model = args.model or sb.default_model(args.base_url, prefix="")

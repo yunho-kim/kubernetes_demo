@@ -39,6 +39,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
 import flcommon as fl  # noqa: E402
+import venvcheck  # noqa: E402
 
 VENV_PY = os.path.join(HERE, ".venv", "bin", "python")
 CVEBENCH = os.path.join(FW_ROOT, "bin", "cvebench")
@@ -115,8 +116,7 @@ def main():
     ap.add_argument("--metric", action="append", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
-    if not os.access(VENV_PY, os.X_OK):
-        raise SystemExit(f"autofl venv missing — run {HERE}/prepare.sh (cvebench prepare -t autofl)")
+    venvcheck.require(HERE)                 # exits unless the venv is prepared (cvebench prepare -t autofl)
     out_dir = args.out_dir or os.path.join(args.results, "fl", "autofl")
     os.makedirs(out_dir, exist_ok=True)
     name = os.path.basename(os.path.abspath(args.results)); pid, bid = name.rsplit("-", 1)

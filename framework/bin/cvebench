@@ -125,16 +125,29 @@ cmd_test() { need PID BID
 cmd_coverage() { need PID BID; "$HERE/cvebench-coverage" "$PID" "$BID"; }
 
 # ---- tools: built-in sbfl + adapters under framework/tools/<tool>/ (docs/INTEGRATION.md) ----
+# status: built-in | ready (nothing to prepare) | prepared | stale | broken | NOT prepared.
+# Python tools (requirements.lock, or a .venv linked to another tool's) are checked by
+# framework/lib/venvcheck.py against .venv/.cvebench-stamp (framework/lib/pyenv.sh); the
+# others (mbfl, fangelix) count as prepared once their prepare.sh left .venv/ or .prepared.
 cmd_tools() { printf '%-10s %-4s %-14s %s\n' tool kind status description
+  local notes=() t st why desc d
   for t in $(list_tools); do
-    local st desc
+    d="$TOOLS_ROOT/$t"
     if [[ "$t" == sbfl ]]; then st=built-in; desc="Ochiai/Tarantula/Jaccard/D*/Op2/Barinel/GP13/Kulczynski2/Ample (framework/bin/sbfl-rank)"
-    elif [[ ! -x "$TOOLS_ROOT/$t/prepare.sh" ]]; then st=ready
-    elif [[ -d "$TOOLS_ROOT/$t/.venv" || -e "$TOOLS_ROOT/$t/.prepared" ]]; then st=prepared
-    else st="NOT prepared"; fi
-    [[ "$t" == sbfl ]] || desc="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("description",""))' "$TOOLS_ROOT/$t/tool.json" 2>/dev/null || true)"
+    elif [[ ! -x "$d/prepare.sh" ]]; then st=ready
+    else
+      IFS=$'\t' read -r st why < <(python3 "$FW_ROOT/lib/venvcheck.py" "$d")
+      case "$st" in
+        unmanaged) if [[ -d "$d/.venv" || -e "$d/.prepared" ]]; then st=prepared; else st="NOT prepared"; fi;;
+        missing) st="NOT prepared";;
+        prepared) ;;
+        *) notes+=("$t: $st — $why (cvebench prepare -t $t)");;
+      esac
+    fi
+    [[ "$t" == sbfl ]] || desc="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("description",""))' "$d/tool.json" 2>/dev/null || true)"
     printf '%-10s %-4s %-14s %s\n' "$t" "$(tool_kind "$t")" "$st" "$desc"
-  done; }
+  done
+  for t in ${notes[@]+"${notes[@]}"}; do warn "$t"; done; }
 
 cmd_prepare() { need TOOL
   local p="$TOOLS_ROOT/$TOOL/prepare.sh"

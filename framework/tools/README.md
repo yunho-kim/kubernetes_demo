@@ -10,8 +10,10 @@ installed into a private, git-ignored location under the tool directory by its
 ```
 framework/tools/<tool>/
 ├── tool.json         # {"name","kind":"fl"|"apr","description","reference","url","granularity"}
-├── prepare.sh        # optional one-off setup on a new machine (venv, pip, downloads …)
-├── requirements.txt  # pinned dependencies (when the tool is Python)
+├── prepare.sh        # optional one-off setup on a new machine (venv, downloads …)
+├── versions.env      # pinned upstream commits/versions; PYTHON_VERSION=X.Y.Z (Python tools)
+├── requirements.in   # Python tools: direct dependencies (pinned ==)
+├── requirements.lock # Python tools: full dependency tree with hashes (framework/lib/pyenv.sh lock)
 ├── run               # adapter:  FL : run <results-dir> -o <out-dir> [--metric M] [args]
 │                     #           APR: run <results-dir> <workdir> -o <out-dir> [args]
 └── .venv/            # created by prepare.sh, never committed
@@ -19,7 +21,16 @@ framework/tools/<tool>/
 
 `cvebench prepare -t <tool>` runs `prepare.sh`; `cvebench fl -t <tool>` /
 `cvebench apr -t <tool>` run the adapter; `cvebench summary` compares every
-tool's `ranking.json` / `validation.json`.
+tool's `ranking.json` / `validation.json`. A Python tool's `prepare.sh` builds
+its `.venv` with `framework/lib/pyenv.sh` (uv-managed CPython `PYTHON_VERSION`
+in `framework/.python/` + `uv pip sync requirements.lock`); `cvebench tools`
+shows whether it is `prepared`, `stale` (lock or Python pin changed since) or
+`broken` (interpreter gone or changed), and each `run` refuses a stale or broken
+venv with the `cvebench prepare -t <tool>` to run.
+
+Python of each venv (`PYTHON_VERSION`): 3.12.12 for `autofl` (shared by `cosmosfl`),
+`flitsr`, `llmao`, `darjeeling`; 3.11.14 for `looprepair`; 3.13.5 for `miniswe` (shared
+by `liveswe`), `openhands`, `magentless`.
 
 | tool | kind | what | reference |
 | --- | --- | --- | --- |

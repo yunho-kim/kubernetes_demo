@@ -1,0 +1,7 @@
+# AutoFL adapter runtime: OpenAI-compatible chat API client + C and Go parsers for the function index.
+# Direct dependencies only; the full tree with hashes is requirements.lock (framework/lib/pyenv.sh lock).
+# Versions = the ones the adapter's results so far were produced with.
+openai==3.3.1
+tree-sitter==0.26.0
+tree-sitter-c==0.24.2
+tree-sitter-go==0.25.0

@@ -2,6 +2,7 @@
 # packages. json_repair is unpinned upstream: 0.35.0 is the release current when upstream
 # pinned openai 1.59.8 (Jan 2025). tree_sitter 0.20.1 (upstream pin) has no Linux wheel;
 # 0.20.4 has the same API (Language.build_library, Parser.set_language) and wheels.
+# Direct dependencies only; the full tree with hashes is requirements.lock (framework/lib/pyenv.sh lock).
 openai==1.59.8
 httpx==0.28.1
 pydantic==2.10.5
