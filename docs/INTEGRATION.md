@@ -465,7 +465,9 @@ Reference implementations:
   command. Two HAProxy-specific settings are recorded in the adapter: the build
   command is a one-word script (the image's Bear passes only the first word of a
   command to the shell), and HAProxy is built with `DEFINE=-DMAX_THREADS=1`
-  (Angelix's runtime appends every thread's trace to one file).
+  (Angelix's runtime appends every thread's trace to one file). For the same reason
+  relevant tests that start several HAProxy processes are left out of its test set
+  and listed in `fangelix.json`.
 
 Shared code: `framework/lib/aprsandbox.py` — the benchmark's make arguments,
 helper commands, `setup_cmd` (hides the answer, 5.7), `bug_report`,

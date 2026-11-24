@@ -273,12 +273,13 @@ def main():
                 os.path.exists(os.path.join(out_dir, "candidates", f"{sid}.patch")) and os.remove(
                     os.path.join(out_dir, "candidates", f"{sid}.patch"))
                 continue
-            if diff in by_diff:  # identical to an earlier sample: one candidate
+            key = mp.strip()     # the model patch, not `diff`, whose headers carry file times
+            if key in by_diff:   # identical to an earlier sample: one candidate
                 os.remove(os.path.join(out_dir, "candidates", f"{sid}.patch"))
-                cands[sid] = {"candidate": by_diff[diff], "note": "same patch as an earlier sample"}
+                cands[sid] = {"candidate": by_diff[key], "note": "same patch as an earlier sample"}
             else:
-                by_diff[diff] = f"candidates/{sid}.patch"
-                cands[sid] = {"candidate": by_diff[diff], "patch_lines": sb.patch_lines(diff)}
+                by_diff[key] = f"candidates/{sid}.patch"
+                cands[sid] = {"candidate": by_diff[key], "patch_lines": sb.patch_lines(diff)}
             cands[sid]["selected"] = bool(selected) and mp.strip() == selected
     summary = {
         "model": model, "sets": args.sets, "samples": args.samples,
