@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""run — cvebench APR adapter for Live-SWE-agent (Xia, Wang, Yang, Wei, Zhang; arXiv 2511.13646, 2025).
+
+    run <results-dir> <workdir> -o <out-dir> [miniswe options]
+
+Live-SWE-agent is mini-swe-agent with a configuration that has the agent write its own
+tools (Python scripts) while it works — upstream ships only config/*.yaml and runs them
+with `mini --config`. This adapter therefore runs the miniswe adapter's pipeline
+(framework/tools/miniswe/run: sandbox of the buggy image, bug report, export of the
+src/ and include/ edits as candidates/run<k>.patch) with config.yaml here, which is
+miniswe's cvebench configuration plus exactly Live-SWE-agent's changes (see its header).
+Options are miniswe's (--runs, --step-limit [default 250 here], --time-limit, --model,
+--base-url, --protocol, --fl, --replay, ...); per-run status goes to <out-dir>/liveswe.json.
+"""
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MINISWE_RUN = os.path.join(HERE, "..", "miniswe", "run")
+args = sys.argv[1:]
+if not any(a == "--config" or a.startswith("--config=") for a in args):
+    args += ["--config", os.path.join(HERE, "config.yaml")]
+if not any(a == "--tool" or a.startswith("--tool=") for a in args):
+    args += ["--tool", "liveswe"]
+os.execv(sys.executable, [sys.executable, os.path.abspath(MINISWE_RUN)] + args)

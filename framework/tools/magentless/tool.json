@@ -1,0 +1,8 @@
+{
+  "name": "magentless",
+  "kind": "apr",
+  "description": "MagentLess (Agentless for C/C++/Go/Java/Rust/TS): agent-free pipeline — hierarchical localization (LLM file ranking + embedding retrieval -> related functions/variables -> edit lines, 2 sampled location sets), 2 SEARCH/REPLACE repair samples per set, majority-vote selection; upstream stages run unchanged (mlrun.py: output-token floor for reasoning models, generic embeddings client); every distinct sample patch is a candidate",
+  "reference": "C. S. Xia, Y. Deng, S. Dunn, L. Zhang. Agentless: Demystifying LLM-based Software Engineering Agents. FSE 2025. MagentLess: D. Zan et al., Multi-SWE-bench: A Multilingual Benchmark for Issue Resolving. NeurIPS 2025 Datasets & Benchmarks.",
+  "url": "https://github.com/multi-swe-bench/MagentLess",
+  "granularity": "patch"
+}

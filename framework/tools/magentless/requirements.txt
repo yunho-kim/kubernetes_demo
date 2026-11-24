@@ -1,0 +1,19 @@
+# What the MagentLess stages the adapter runs import (upstream requirements.txt, minus the
+# SWE-bench evaluation harness, which those stages do not use), pinned to versions from
+# upstream's commit date (2025-07) that have Python 3.12/3.13 wheels.
+openai==1.97.0
+anthropic==0.58.2
+tiktoken==0.9.0
+libcst==1.8.2
+llama-index-core==0.12.52
+llama-index-embeddings-openai==0.3.1
+jsonlines==4.0.0
+datasets==3.6.0
+pandas==2.3.1
+tqdm==4.67.1
+tree-sitter==0.24.0
+tree-sitter-cpp==0.23.4
+tree-sitter-go==0.23.4
+tree-sitter-java==0.23.5
+tree-sitter-typescript==0.23.2
+tree-sitter-rust==0.23.2

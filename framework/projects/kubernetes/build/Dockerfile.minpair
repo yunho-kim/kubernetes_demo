@@ -28,9 +28,11 @@ ARG FIX_PATCH
 # APR: an optional candidate patch applied on top of the variant (cvebench validate)
 ARG CANDIDATE_PATCH=build/empty.patch
 COPY "$FIX_PATCH" /tmp/fix.patch
-# buggy = fixed release with the fix reverse-applied (minimal pair)
+# buggy = fixed release with the fix reverse-applied (minimal pair). --no-backup-if-mismatch:
+# a hunk applied at an offset would otherwise leave <file>.orig = the FIXED file in the image
+# (haproxy-2/3 did, and APR agents read it).
 RUN if [ "$VARIANT" = "buggy" ]; then \
-        echo "== reverse-applying fix to create BUGGY ==" && patch -R -p1 < /tmp/fix.patch ; \
+        echo "== reverse-applying fix to create BUGGY ==" && patch -R -p1 --no-backup-if-mismatch < /tmp/fix.patch ; \
     else echo "== FIXED variant (no patch) ==" ; fi; rm -f /tmp/fix.patch
 COPY "$CANDIDATE_PATCH" /tmp/candidate.patch
 RUN if [ -s /tmp/candidate.patch ]; then \

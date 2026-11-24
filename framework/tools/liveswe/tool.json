@@ -1,0 +1,8 @@
+{
+  "name": "liveswe",
+  "kind": "apr",
+  "description": "Live-SWE-agent: mini-swe-agent with upstream's self-evolving configuration — the agent is told to create its own Python tools (at least an edit tool) and is prompted after every command to consider new tools; same sandbox, bug report and patch export as miniswe (only Live-SWE-agent's config changes differ; step limit 250)",
+  "reference": "C. S. Xia, Z. Wang, Y. Yang, Y. Wei, L. Zhang. Live-SWE-agent: Can Software Engineering Agents Self-Evolve on the Fly? arXiv:2511.13646, 2025.",
+  "url": "https://github.com/OpenAutoCoder/live-swe-agent",
+  "granularity": "patch"
+}

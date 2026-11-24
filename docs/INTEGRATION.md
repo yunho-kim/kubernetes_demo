@@ -438,6 +438,37 @@ Reference implementations:
   docstring) and in `tool.json`, so results are not mistaken for the original
   tool's.
 
+* `framework/tools/liveswe/` — a **variant that is only a configuration** of an
+  integrated tool (Live-SWE-agent = mini-swe-agent + a config that has the agent
+  write its own tools). It reuses the `miniswe` adapter (`miniswe/run --config
+  --tool`, the miniswe venv linked as `.venv`) and its `config.yaml` is miniswe's
+  plus exactly the upstream config's changes (obtained by diffing upstream's config
+  against the mini-swe-agent config it was derived from), so the two tools differ
+  only by the technique.
+
+* `framework/tools/magentless/` — a **multi-stage pipeline run stage by stage**
+  (MagentLess, Agentless for C/Go/…). Upstream's dataset and repository inputs are
+  produced in its own formats (a one-instance `data/<lang>/*.jsonl` whose problem
+  statement is the same bug report the agents get; the repository structure from
+  upstream's parser over the buggy tree), and each upstream script runs unchanged
+  through a small launcher (`mlrun.py`) that applies two run-time substitutions for
+  local models: an output-token floor (a reasoning model's thinking counts against
+  `max_tokens`) and an embeddings client for any OpenAI-compatible endpoint. Every
+  distinct sample patch is a candidate; upstream's own selection is recorded.
+
+* `framework/tools/fangelix/` — a **semantics-based tool distributed as a Docker
+  image** (FAngelix, an Angelix extension; LLVM 2.9/3.7, KLEE, Z3 toolchain). It runs
+  unchanged in a derived image that adds VTest; the adapter supplies what Angelix
+  needs from a user: the file to repair (from an FL ranking — naming the fixed file
+  would be oracle localization), a test script (`oracle <id>`, vtest), the test ids
+  (relevant tests that fail on the plain buggy build are dropped) and a build
+  command. Two HAProxy-specific settings are recorded in the adapter: the build
+  command is a one-word script (the image's Bear passes only the first word of a
+  command to the shell), and HAProxy is built with `DEFINE=-DMAX_THREADS=1`
+  (Angelix's runtime appends every thread's trace to one file). For the same reason
+  relevant tests that start several HAProxy processes are left out of its test set
+  and listed in `fangelix.json`.
+
 Shared code: `framework/lib/aprsandbox.py` — the benchmark's make arguments,
 helper commands, `setup_cmd` (hides the answer, 5.7), `bug_report`,
 `export_patch`.
@@ -451,6 +482,14 @@ not violate rule 6.2). When doing so, remove what would reveal the fix:
 
 * `/tmp/fix.patch` — the upstream fix the image build reverse-applied;
 * `CHANGELOG` of the fixed release (it lists the fix commit's subject);
+* patch backups `*.orig` / `*.rej` in the tree — `patch -R` leaves `<file>.orig`
+  (= the *fixed* file) when a hunk applies at an offset. The benchmark now
+  reverse-applies with `--no-backup-if-mismatch`, but buggy images built before
+  that (haproxy-2 and -3 had `src/http_ana.c.orig`, `src/h1.c.orig`) still hold them,
+  and agents found and copied them;
+* the above in **every** copy of the tree the agent can reach — an adapter whose
+  agent works on a copy (OpenHands) must also clean the image's own `/build` tree
+  (`aprsandbox.setup_cmd(tree, also=[bug.src])`);
 * network access (`docker run --network none`) — upstream sources are online;
 * the crafted trigger tests' `#` comments (they describe buggy vs fixed
   behaviour and sometimes name the fixed function) and CVE identifiers.

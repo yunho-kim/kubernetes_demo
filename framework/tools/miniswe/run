@@ -4,6 +4,12 @@
     run <results-dir> <workdir> -o <out-dir> [--runs 1] [--step-limit 80] [--time-limit 3600]
         [--model M] [--base-url URL] [--protocol tools|text] [--temperature T]
         [--fl TOOL[:FORMULA]] [--fl-top 10] [--keep-comments] [--no-redact] [--fresh]
+        [--config FILE --tool NAME]
+
+--config/--tool run the same pipeline with another mini-swe-agent configuration
+(framework/tools/liveswe = Live-SWE-agent); NAME prefixes the log and names the
+summary file <out-dir>/<NAME>.json. A config may set agent.step_limit (the default
+of --step-limit).
 
 LLM endpoint: any model litellm supports. For an OpenAI-compatible server set
   OPENAI_BASE_URL (or --base-url), OPENAI_API_KEY, and MSWEA_MODEL (or --model) =
@@ -45,7 +51,8 @@ def main():
     ap.add_argument("workdir")
     ap.add_argument("-o", "--out-dir", required=True)
     ap.add_argument("--runs", type=int, default=1, help="independent agent runs (one candidate each)")
-    ap.add_argument("--step-limit", type=int, default=80, help="max LLM calls per run")
+    ap.add_argument("--step-limit", type=int, default=None,
+                    help="max LLM calls per run (default: the config's agent.step_limit, else 80)")
     ap.add_argument("--time-limit", type=int, default=3600, help="wall-clock seconds per run")
     ap.add_argument("--model", default=os.getenv("MSWEA_MODEL"))
     ap.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL"))
@@ -59,6 +66,8 @@ def main():
     ap.add_argument("--keep-comments", action="store_true",
                     help="keep the trigger test's # comments (default: removed — they describe the fix)")
     ap.add_argument("--fresh", action="store_true", help="redo runs that already have a trajectory")
+    ap.add_argument("--config", default=os.path.join(HERE, "config.yaml"), help="mini-swe-agent configuration")
+    ap.add_argument("--tool", default="miniswe", help="tool name: log prefix and <out-dir>/<tool>.json")
     ap.add_argument("--replay", default=None, metavar="FILE",
                     help="no LLM: issue the bash commands in FILE (one per line) and submit — a pipeline self-test "
                          "(e.g. selftest.cmds)")
@@ -80,13 +89,16 @@ def main():
 
     bug = sb.Bug(args.workdir)
     pid, bid, src = bug.pid, bug.bid, bug.src
-    bug.ensure_image("miniswe")
+    tag = args.tool
+    bug.ensure_image(tag)
 
     replay = [l.rstrip("\n") for l in open(args.replay) if l.strip() and not l.startswith("#")] if args.replay else None
     model_name = "replay" if replay else args.model or (sb.default_model(args.base_url) if args.base_url else None)
     if not model_name:
         raise SystemExit("no model: set MSWEA_MODEL (litellm name) or OPENAI_BASE_URL")
-    cfg = yaml.safe_load(open(os.path.join(HERE, "config.yaml")))
+    cfg = yaml.safe_load(open(args.config))
+    if args.step_limit is None:
+        args.step_limit = cfg["agent"].get("step_limit", 80)
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(os.path.join(out_dir, "candidates"), exist_ok=True)
 
@@ -94,7 +106,7 @@ def main():
     sbx = os.path.join(out_dir, "sandbox")
     trig = sb.write_helpers(bug, sbx, keep_comments=args.keep_comments, redact=not args.no_redact)
 
-    summary_p = os.path.join(out_dir, "miniswe.json")
+    summary_p = os.path.join(out_dir, f"{tag}.json")
     summary = json.load(open(summary_p)) if os.path.exists(summary_p) else {}
     model_kwargs = {"drop_params": True}
     if args.base_url and model_name.startswith("openai/"):
@@ -113,7 +125,7 @@ def main():
         rdir = os.path.join(out_dir, "runs", rid)
         traj = os.path.join(rdir, "trajectory.json")
         if os.path.exists(traj) and not args.fresh:
-            print(f"[miniswe] {rid}: done before (trajectory exists; --fresh to redo)", flush=True)
+            print(f"[{tag}] {rid}: done before (trajectory exists; --fresh to redo)", flush=True)
             continue
         os.makedirs(rdir, exist_ok=True)
         cand = os.path.join(out_dir, "candidates", f"{rid}.patch")
@@ -144,7 +156,7 @@ def main():
                 env, system_template=cfg["agent"]["system_template"], instance_template=cfg["agent"]["instance_template"],
                 step_limit=args.step_limit, cost_limit=0, wall_time_limit_seconds=args.time_limit,
                 output_path=Path(traj))
-            print(f"[miniswe] {pid}-{bid} {rid}: agent start ({model_name}, {args.protocol}, "
+            print(f"[{tag}] {pid}-{bid} {rid}: agent start ({model_name}, {args.protocol}, "
                   f"≤{args.step_limit} steps, ≤{args.time_limit}s)", flush=True)
             try:
                 res = agent.run(task, src=src, protocol=args.protocol)
@@ -159,7 +171,7 @@ def main():
                         "model": model_name, "protocol": args.protocol, "fl": args.fl,
                         "changed_files": files, "patch_lines": n, "candidate": f"candidates/{rid}.patch" if n else None}
         json.dump(summary, open(summary_p, "w"), indent=2)
-        print(f"[miniswe] {rid}: {status}, {agent.n_calls} steps, {summary[rid]['seconds']}s, "
+        print(f"[{tag}] {rid}: {status}, {agent.n_calls} steps, {summary[rid]['seconds']}s, "
               f"changed {files or 'nothing'} -> " + (f"candidates/{rid}.patch ({n} lines)" if n else "no candidate"),
               flush=True)
 

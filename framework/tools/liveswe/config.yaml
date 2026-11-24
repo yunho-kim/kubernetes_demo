@@ -1,0 +1,196 @@
+# Live-SWE-agent configuration for cvebench = framework/tools/miniswe/config.yaml plus
+# Live-SWE-agent's changes to the mini-swe-agent SWE-bench config (upstream
+# config/livesweagent_swebench.yaml @ 8d7dd86 vs mini-swe-agent config/extra/swebench.yaml
+# @ 6ff7d26 — that diff is all Live-SWE-agent changes):
+#   1. the "IMPORTANT TOOL CREATION INSTRUCTIONS" section and its two examples (verbatim;
+#      the example fences follow the run's protocol, `python` -> `python3`, the sandbox
+#      has no `python`),
+#   2. the reflection prompt appended to every command output, and "or create a tool" in
+#      the long-output warning (verbatim),
+#   3. step_limit 250 (upstream's SWE-bench value; miniswe's cvebench default is 80).
+# Everything else (task text, helper commands, sandbox) is miniswe's, so the two tools
+# differ only by Live-SWE-agent's on-the-fly tool creation.
+# Template variables: task, src, protocol (as in miniswe).
+agent:
+  system_template: |
+    You are a helpful assistant that can interact with a computer shell to fix bugs in C programs.
+    {%- if protocol == "text" %}
+
+    Your response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).
+    Include a THOUGHT section before your command where you explain your reasoning process.
+    Format your response as shown in <format_example>.
+
+    <format_example>
+    THOUGHT: Your reasoning and analysis here.
+
+    ```mswea_bash_command
+    your_command_here
+    ```
+    </format_example>
+    {%- endif %}
+  instance_template: |
+    <bug_report>
+    {{task}}
+    </bug_report>
+
+    <instructions>
+    # Task
+
+    You are working in the source tree of HAProxy (a C program) at {{src}}.
+    A regression test fails on this tree; its expectations describe the intended behaviour.
+    Change the program's source code (files under src/ and include/) so that the failing
+    test passes, without breaking the other regression tests. Fix the root cause in a way
+    that is general and consistent with the codebase — do not special-case the test.
+
+    ## Environment
+
+    - The tree is already built. Two helper commands are on PATH:
+      - `cvebench-build` — rebuilds HAProxy incrementally after your edits
+        (prints compiler errors if the build fails).
+      - `cvebench-test [trigger|all|<reg-tests/...vtc> ...]` — rebuilds, then runs the failing
+        test (`trigger`, the default), the failing test plus the related regression tests
+        (`all`), or the given tests, and prints PASS/FAIL with vtest's failure messages.
+    - The failing test is /cvebench/trigger.vtc. Do NOT modify tests, the build system, or the
+      helper commands; only src/ and include/ changes are kept.
+    - There is no network access. Every command runs in a new subshell: `cd` and environment
+      changes do not persist, so prefix commands with `cd {{src}} && ...` if needed.
+    - Avoid interactive tools (vi, nano, less). View files with e.g. `nl -ba src/h1.c | sed -n '100,160p'`
+      and edit with sed, python3, or a heredoc.
+
+    {% set fence = "mswea_bash_command" if protocol == "text" else "bash" -%}
+    **IMPORTANT TOOL CREATION INSTRUCTIONS**
+    ## Creating your own tools 
+    - You can also create your own tools in Python to help with your workflow
+    - Compared to basic bash commands, the tools you create should be able to better aid your workflow in solving the task
+    - Ensure each tool you create is in Python, contains informative outputs or error messages, and can be ran from the command line
+    - You should at least create a simple edit tool that can help you effectively edit arbitrary files instead of using bash commands
+    - The tools you create can be for any purpose, it does not need to be general, instead think about how it can help you specifically with the current task at hand
+
+    ### Example of creating a custom tool:
+    <example_response>
+    THOUGHT: I noticed that in order to solve the issue I need to ... therefore I should create a custom tool to help me ...
+
+    ```{{fence}}
+    cat <<'EOF' > /path/to/tool_name.py
+    #!/usr/bin/env python3
+    import sys
+    # Import other packages if needed
+
+    def main():
+        # Your tool logic here
+        ...
+
+    if __name__ == "__main__":
+        main()
+    EOF
+    ```
+    </example_response>
+
+    ### Example of using the tool you created:
+    <example_response>
+    THOUGHT: Let me use the custom tool I created to help me with ...
+
+    ```{{fence}}
+    python3 /path/to/tool_name.py <<EOF
+    your_input_here
+    EOF
+    ```
+    </example_response>
+
+    ## Recommended workflow
+
+    1. Read the failing test and its failure output; find the code that handles the request.
+    2. Form a hypothesis about the root cause and edit the source.
+    3. Run `cvebench-test` until the failing test passes, then `cvebench-test all`.
+    4. When you are done, submit with the command below (on its own, not combined with others).
+       You cannot continue working after it.
+
+    {% if protocol == "text" -%}
+    ```mswea_bash_command
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+    ```
+
+    Every response must contain exactly one command in a ```mswea_bash_command block.
+    {%- else -%}
+    `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+
+    Every response must include at least one call of the bash tool.
+    {%- endif %}
+    </instructions>
+  step_limit: 250
+
+environment:
+  timeout: 900
+  interpreter: ["bash", "-c"]
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PATH: /cvebench/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+model:
+  observation_template: |
+    {% if output.exception_info -%}
+    <exception>{{output.exception_info}}</exception>
+    {% endif -%}
+    <returncode>{{output.returncode}}</returncode>
+    {% if output.output | length < 10000 -%}
+    <output>
+    {{ output.output -}}
+    </output>
+    Reflect on the previous trajectories and decide if there are any tools you can create to help you with the current task.
+    Note that just because you can use basic bash commands doesn't mean you should not create any tools that can still be helpful.
+    {%- else -%}
+    <warning>
+    The output of your last command was too long.
+    Please try a different command that produces less output.
+    If you're looking at a file you can try use head, tail, sed or create a tool to view a smaller number of lines selectively.
+    If you're using grep or find and it produced too much output, you can use a more selective search pattern.
+    </warning>
+    {%- set elided_chars = output.output | length - 10000 -%}
+    <output_head>
+    {{ output.output[:5000] }}
+    </output_head>
+    <elided_chars>
+    {{ elided_chars }} characters elided
+    </elided_chars>
+    <output_tail>
+    {{ output.output[-5000:] }}
+    </output_tail>
+    {%- endif -%}
+  format_error_template_tools: |
+    {% if finish_reason is defined and (finish_reason == "length" or (finish_reason == "tool_calls" and not has_tool_calls)) -%}
+    Your previous response reached the output token limit (finish_reason={{ finish_reason }}) before you produced a tool call, so it was cut off. Respond more concisely and finish with exactly one bash tool call.
+    {%- else -%}
+    Tool call error:
+
+    <error>
+    {{error}}
+    </error>
+
+    Every response needs to use the 'bash' tool at least once to execute commands:
+    - Tool: bash
+    - Arguments: {"command": "your_command_here"}
+
+    If you have completed the fix, submit with `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+    {%- endif %}
+  format_error_template_text: |
+    {% if finish_reason is defined and finish_reason == "length" -%}
+    Your previous response reached the output token limit before you produced a complete action, so it was cut off. Respond more concisely and provide exactly one action in the required format.
+    {%- else -%}
+    Format error:
+
+    <error>
+    {{error}}
+    </error>
+
+    Please always provide EXACTLY ONE action in triple backticks, found {{actions|length}} actions.
+    If you have completed the fix, submit with `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+    without any other command. Else, please format your response exactly as follows:
+
+    THOUGHT: Here are some thoughts about why you want to perform the action.
+
+    ```mswea_bash_command
+    <action>
+    ```
+    {%- endif %}

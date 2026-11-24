@@ -87,7 +87,7 @@ cmd_checkout() { need PID BID VAR WD
   local src; src="$WD/$(p_srcname "$v")"
   if [[ "$VAR" == buggy ]]; then
     log "reverse-applying the fix (minimal pair)"
-    ( cd "$src" && patch -R -p1 < "$(proj_dir "$PID")/patches/$BID.fix.patch" >/dev/null )
+    ( cd "$src" && patch -R -p1 --no-backup-if-mismatch < "$(proj_dir "$PID")/patches/$BID.fix.patch" >/dev/null )  # no <file>.orig (= the fixed file)
   fi
   cp -a "$(proj_dir "$PID")/tests/$BID" "$WD/cvebench-tests"
   printf '%s %s %s\n' "$PID" "$BID" "$VAR" > "$WD/cvebench.bug"
@@ -130,7 +130,7 @@ cmd_tools() { printf '%-10s %-4s %-14s %s\n' tool kind status description
     local st desc
     if [[ "$t" == sbfl ]]; then st=built-in; desc="Ochiai/Tarantula/Jaccard/D*/Op2/Barinel/GP13/Kulczynski2/Ample (framework/bin/sbfl-rank)"
     elif [[ ! -x "$TOOLS_ROOT/$t/prepare.sh" ]]; then st=ready
-    elif [[ -d "$TOOLS_ROOT/$t/.venv" ]]; then st=prepared
+    elif [[ -d "$TOOLS_ROOT/$t/.venv" || -e "$TOOLS_ROOT/$t/.prepared" ]]; then st=prepared
     else st="NOT prepared"; fi
     [[ "$t" == sbfl ]] || desc="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("description",""))' "$TOOLS_ROOT/$t/tool.json" 2>/dev/null || true)"
     printf '%-10s %-4s %-14s %s\n' "$t" "$(tool_kind "$t")" "$st" "$desc"
@@ -151,7 +151,7 @@ cmd_diff() { need WD   # edits in a checkout vs the pristine version -> unified 
   load_project "$pid"
   local v s tmp x xs=(); v="$(bug_fixedver "$pid" "$bid")"; s="$(p_srcname "$v")"; tmp="$(mktemp -d)"
   p_fetch_src "$v" "$tmp/pristine"
-  [[ "$var" == buggy ]] && ( cd "$tmp/pristine/$s" && patch -R -p1 < "$(proj_dir "$pid")/patches/$bid.fix.patch" >/dev/null )
+  [[ "$var" == buggy ]] && ( cd "$tmp/pristine/$s" && patch -R -p1 --no-backup-if-mismatch < "$(proj_dir "$pid")/patches/$bid.fix.patch" >/dev/null )
   ln -s "$tmp/pristine/$s" "$tmp/a"; ln -s "$(cd "$WD" && pwd)/$s" "$tmp/b"
   for x in "${P_DIFF_EXCLUDES[@]}"; do xs+=(-x "$x"); done
   ( cd "$tmp" && diff -ruN "${xs[@]}" a b | grep -v -e '^diff -ruN ' -e '^Binary files ' ) || true

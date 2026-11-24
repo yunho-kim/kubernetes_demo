@@ -146,11 +146,20 @@ def write_helpers(bug, sbx, keep_comments=False, redact=True):
     return trig
 
 
-def setup_cmd(src):
+def hide_cmd(tree):
+    """Shell command deleting from a source tree what reveals the fix: the fixed release's
+    CHANGELOG and patch backups (*.orig / *.rej — a buggy image built before
+    --no-backup-if-mismatch holds <file>.orig = the FIXED file)."""
+    return f"rm -f {tree}/CHANGELOG && find {tree} \\( -name '*.orig' -o -name '*.rej' \\) -type f -delete"
+
+
+def setup_cmd(src, also=()):
     """Shell command (run as root in the sandbox before the agent starts): delete the
-    upstream fix patch left by the image build and the fixed release's CHANGELOG,
-    resolve the relevant reg-tests, and mark the start time for export_patch."""
-    return (f"rm -f /tmp/fix.patch /tmp/candidate.patch {src}/CHANGELOG && "
+    upstream fix patch left by the image build and hide_cmd() the tree <src> and any other
+    copy of it in the sandbox (`also`: e.g. the image's own /build tree when the agent works
+    on a copy), resolve the relevant reg-tests, and mark the start time for export_patch."""
+    return ("rm -f /tmp/fix.patch /tmp/candidate.patch && "
+            + "".join(f"{hide_cmd(t)} && " for t in (src, *also)) +
             f"cd {src} && ls $(cat /cvebench/globs.txt) 2>/dev/null | sort -u | while read -r v; do "
             "id=$(printf '%s' \"$v\" | sed 's#reg-tests/##; s#[/.]#_#g'); "
             "grep -qx \"$id\" /cvebench/relevant_ids.txt && echo \"$v\"; done > /tmp/relevant_vtc.txt; "
