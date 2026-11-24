@@ -39,6 +39,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
 import flcommon as fl  # noqa: E402
+import venvcheck  # noqa: E402
 
 AUTOFL = os.path.join(FW_ROOT, "tools", "autofl")
 PINS = dict(l.strip().split("=", 1) for l in open(os.path.join(HERE, "versions.env")) if "=" in l and not l.startswith("#"))
@@ -77,8 +78,7 @@ def main():
     ap.add_argument("--metric", action="append", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
-    if not os.access(os.path.join(AUTOFL, ".venv", "bin", "python"), os.X_OK):
-        raise SystemExit(f"cosmosfl needs the autofl adapter — run {HERE}/prepare.sh (cvebench prepare -t cosmosfl)")
+    venvcheck.require(HERE)                 # .venv = the autofl adapter's venv (cvebench prepare -t cosmosfl)
     models = []
     for spec in args.models.split(","):
         name, _, url = spec.strip().partition("@")

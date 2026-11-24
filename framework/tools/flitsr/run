@@ -27,6 +27,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "lib"))
 import flcommon as fl  # noqa: E402
+import venvcheck  # noqa: E402
 
 FLITSR = os.path.join(HERE, ".venv", "bin", "flitsr")
 DEFAULT_METRICS = ("ochiai", "dstar", "tarantula", "gp13", "barinel")
@@ -93,9 +94,7 @@ def main():
     ap.add_argument("--top", type=int, default=15)
     args = ap.parse_args()
 
-    if not os.access(FLITSR, os.X_OK):
-        raise SystemExit(f"flitsr not installed at {FLITSR} — run {HERE}/prepare.sh "
-                         f"(or: cvebench prepare -t flitsr)")
+    venvcheck.require(HERE)                 # exits unless the venv is prepared (cvebench prepare -t flitsr)
     out_dir = args.out_dir or os.path.join(args.results, "fl", "flitsr")
     os.makedirs(out_dir, exist_ok=True)
     cli_dir = os.path.join(out_dir, "gzoltar-cli")

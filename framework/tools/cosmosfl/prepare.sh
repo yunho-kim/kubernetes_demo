@@ -3,7 +3,8 @@
 #
 # COSMosFL runs AutoFL with several small models and combines their votes, so it reuses the
 # AutoFL adapter (framework/tools/autofl: venv with the OpenAI client + tree-sitter-c); this
-# runs that adapter's prepare.sh when its venv is missing and links it as .venv here.
+# runs that adapter's prepare.sh unless its venv is prepared (framework/lib/venvcheck.py: present,
+# working, synced to autofl's requirements.lock) and links it as .venv here.
 # The member models are served at run time by an OpenAI-compatible endpoint, by default
 # Ollama as upstream (http://127.0.0.1:11434/v1). --pull fetches the paper's four 4-bit
 # models into Ollama (COSMOSFL_MODELS in versions.env; ~22 GB):
@@ -13,7 +14,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AUTOFL="$(cd "$HERE/../autofl" && pwd)"
 source "$HERE/versions.env"
 
-[[ -x "$AUTOFL/.venv/bin/python" ]] || "$AUTOFL/prepare.sh"
+[[ "$(python3 "$HERE/../../lib/venvcheck.py" "$AUTOFL" | cut -f1)" == prepared ]] || "$AUTOFL/prepare.sh"
 ln -sfn "$AUTOFL/.venv" "$HERE/.venv"
 "$AUTOFL/.venv/bin/python" "$AUTOFL/autofl_agent.py" --selftest
 

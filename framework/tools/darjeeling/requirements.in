@@ -1,10 +1,13 @@
+# Direct dependencies only; the full tree is requirements.lock (framework/lib/pyenv.sh lock;
+# the two git pins carry no hash there — the commit is the pin).
 # Darjeeling (squaresLab) at a pinned commit — PyPI only has the old 0.1.x series.
 darjeeling @ git+https://github.com/squaresLab/Darjeeling@81803f1dd31f438e71b5fdbf7e18157b3dbe35d8
 # Kaskara exactly as Darjeeling's poetry.lock pins it (a git commit also versioned
 # "0.2.1"): the PyPI 0.2.1 release's C++ backend no longer builds against the current
-# christimperley/llvm18 image.
+# christimperley/llvm18 image. As a direct URL it overrides darjeeling's "kaskara>=0.2.1",
+# so the lock (and `uv pip sync`) use the commit, never the PyPI release of the same version.
 kaskara @ git+https://github.com/ChrisTimperley/Kaskara@f8f49db12f04e5c4f482a1ea94b767b701710afe
 # kaskara imports pkg_resources (removed from setuptools >= 81); darjeeling imports
 # typing_extensions without declaring it.
-setuptools<81
-typing_extensions
+setuptools==80.10.2
+typing-extensions==4.16.0

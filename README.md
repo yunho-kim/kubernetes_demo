@@ -33,6 +33,9 @@ framework/
 │   └── sbfl-rank             # built-in SBFL: Ochiai/Tarantula/Jaccard/D*/Op2/Barinel/GP13/Kulczynski2/Ample + EXAM
 ├── lib/cvebench.sh           # commit-db + kind-cluster helpers
 ├── lib/flcommon.py           # shared FL helpers: spectrum, ground truth, rank/EXAM scoring, ranking.json
+├── lib/pyenv.sh, pyenv.env   # Python tools' venvs: pinned uv-managed CPython + requirements.lock (uv pip sync)
+├── lib/venvcheck.py          # venv health (prepared / stale / broken) for `cvebench tools` and adapters' run
+├── .python/  .uv/            # (git-ignored) the interpreters, and uv itself when the host has none
 ├── tools/<tool>/             # external FL/APR tool adapters (prepare.sh + run), host-native, no docker
 │   ├── flitsr/               # FLITSR / FLITSR* (ISSTA 2023) over the GZoltar spectrum
 │   ├── mbfl/                 # mutation-based FL: Mull mutants + Metallaxis / MUSE
@@ -72,6 +75,25 @@ in `./bin/`. HAProxy coverage builds compile HAProxy from source and run its
 release on `golang:<ver>` (vendored dependencies, tests run offline) and run Go
 tests in throwaway containers; an image is ~2.8 GB and builds in about a minute.
 
+Host requirements (nothing else is assumed):
+
+* Linux x86-64 with glibc >= 2.17 (the benchmark's Python interpreters); the locked
+  wheels of most Python tools (torch, numpy 2.5, greenlet, …) are manylinux_2_28, so in
+  practice glibc >= 2.28 (Debian 10, Ubuntu 20.04, RHEL 8 or newer);
+* `bash`, `curl`, `tar`, `git`, `docker`, and a `python3` (standard library only) for
+  the harness scripts — no tool runs on it;
+* network access while `cvebench compile` / `cvebench prepare` run;
+* an NVIDIA driver only for `llmao` on a GPU (its torch is a CUDA 13 build; CPU works).
+
+The external Python tools never use the host's Python or its pip configuration: each one's
+`prepare.sh` builds a private venv from a uv-managed CPython pinned in its `versions.env`
+(installed into `framework/.python/`) and its committed `requirements.lock`, via
+`framework/lib/pyenv.sh`. The only thing this needs from the host is
+[uv](https://docs.astral.sh/uv/) >= 0.9.18; without one, the pinned uv release is
+downloaded (checksum-verified) into `framework/.uv/`. `cvebench tools` reports each venv as
+`prepared`, `stale` (its lock or Python pin changed: re-run `cvebench prepare -t <tool>`) or
+`broken` (its interpreter no longer runs, e.g. after an OS upgrade).
+
 ## CLI
 
 ```bash
@@ -96,8 +118,8 @@ $cvebench test    -p kubernetes -b 1
 $cvebench coverage -p haproxy -b 3               # per-test coverage + classify + built-in SBFL rank
 $cvebench fl       -p haproxy -b 3               # re-rank with the built-in SBFL (= cvebench sbfl)
 $cvebench fl       -p haproxy -b 3 -f op2        # a single formula
-$cvebench tools                                  # external FL tools and whether they are prepared
-$cvebench prepare  -t flitsr                     # one-off: venv + pip under framework/tools/flitsr/
+$cvebench tools                                  # external tools: prepared / stale / broken / NOT prepared
+$cvebench prepare  -t flitsr                     # one-off: venv (pinned CPython + requirements.lock) under framework/tools/flitsr/
 $cvebench fl       -p haproxy -b 3 -t flitsr     # FLITSR / FLITSR* on the same spectrum
 $cvebench prepare  -t mbfl                       # one-off: Debian + clang + Mull + vtest base image
 $cvebench fl       -p haproxy -b 3 -t mbfl -- --top 300   # mutation-based FL (Metallaxis, MUSE)
@@ -115,8 +137,9 @@ Every FL tool writes `results/<pid>-<bid>/fl/<tool>/ranking.json` (schema in
 `framework/lib/flcommon.py`), scored against `ground_truth.json` with the same
 rank / EXAM code, so tools are directly comparable. External tools live under
 `framework/tools/<tool>/` with a `prepare.sh` that installs everything they need
-into a private, git-ignored venv — no host-specific dependencies and no
-dedicated container; see `framework/tools/README.md` for the adapter contract.
+into a private, git-ignored venv (a pinned uv-managed CPython + the tool's committed
+`requirements.lock`) — no host-specific dependencies and no dedicated container; see
+`framework/tools/README.md` for the adapter contract.
 
 ### Automated program repair (patch generation)
 ```bash

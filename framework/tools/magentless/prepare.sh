@@ -2,7 +2,8 @@
 # prepare.sh — set up the MagentLess APR adapter.
 #
 #   framework/tools/magentless/upstream/   MagentLess @ MAGENTLESS_COMMIT (versions.env)
-#   framework/tools/magentless/.venv/      its Python dependencies (requirements.txt)
+#   framework/tools/magentless/.venv/      CPython (PYTHON_VERSION in versions.env) + its Python
+#                                          dependencies, exactly requirements.lock
 #
 # At run time it needs
 #   * an OpenAI-compatible chat endpoint: OPENAI_BASE_URL, OPENAI_API_KEY [, MAGENTLESS_MODEL;
@@ -12,11 +13,12 @@
 #     nomic-embed-text`; see run --embed-url/--embed-model); `run --no-retrieval` skips it;
 #   * docker and the bug's buggy image (the failing test is run there once to obtain its
 #     output for the bug report).
-# Requirements: git, python3 >= 3.10 with venv (or uv), network.
+# Requirements: git, network.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/versions.env"
-UP="$HERE/upstream"; VENV="$HERE/.venv"; PY="${PYTHON:-python3}"
+source "$HERE/../../lib/pyenv.sh"
+UP="$HERE/upstream"; VENV="$HERE/.venv"
 
 if [[ ! -d "$UP/.git" ]]; then
   echo "[+] cloning $MAGENTLESS_REPO"
@@ -26,18 +28,7 @@ git -C "$UP" fetch -q origin 2>/dev/null || true
 git -C "$UP" checkout -q "$MAGENTLESS_COMMIT"
 echo "[+] MagentLess $(git -C "$UP" log -1 --format='%h %ci')"
 
-if [[ ! -x "$VENV/bin/python" ]]; then
-  if command -v "$PY" >/dev/null && "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
-    "$PY" -m venv "$VENV" || { echo "[x] '$PY -m venv' failed (apt install python3-venv)" >&2; exit 1; }
-    "$VENV/bin/python" -m pip install --quiet --upgrade pip
-  elif command -v uv >/dev/null; then
-    uv venv --quiet --python 3.12 --seed "$VENV"
-  else
-    echo "[x] need python3 >= 3.10 (or uv)" >&2; exit 1
-  fi
-fi
-echo "[+] installing requirements.txt"
-"$VENV/bin/python" -m pip install --quiet -r "$HERE/requirements.txt"
+pyenv_ensure "$HERE"
 # llama-index downloads NLTK data (stopwords, punkt_tab) on first use; fetch it now into a
 # private dir (NLTK_DATA; run uses the same one — NLTK refuses group/world-writable data dirs)
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/cvebench-magentless"

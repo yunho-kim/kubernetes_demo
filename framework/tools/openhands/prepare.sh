@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # prepare.sh — set up the OpenHands APR adapter in a private venv.
 #
-#   framework/tools/openhands/.venv/   python >= 3.12 + openhands-sdk + openhands-tools (PyPI, pinned)
+#   framework/tools/openhands/.venv/   CPython (PYTHON_VERSION in versions.env; the SDK needs
+#                                      >= 3.12) + openhands-sdk + openhands-tools (PyPI, pinned),
+#                                      exactly requirements.lock
 #
 # At run time the agent needs
 #   * an LLM endpoint — any model litellm supports; for an OpenAI-compatible server
@@ -12,25 +14,13 @@
 #                                           the base-url server lists, as openai/<name>)
 #   * docker and the bug's buggy image (cvebench compile) — the sandbox.
 #
-# Requirements: python3 >= 3.12 with venv (or uv), network.
+# Requirements: network (uv, the interpreter and the packages are fetched by framework/lib/pyenv.sh).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV="$HERE/.venv"; PY="${PYTHON:-python3}"
+source "$HERE/../../lib/pyenv.sh"
+VENV="$HERE/.venv"
 
-if [[ ! -x "$VENV/bin/python" ]]; then
-  if command -v "$PY" >/dev/null && "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 12))'; then
-    echo "[+] creating venv $VENV ($("$PY" --version))"
-    "$PY" -m venv "$VENV" || { echo "[x] '$PY -m venv' failed (apt install python3-venv)" >&2; exit 1; }
-    "$VENV/bin/python" -m pip install --quiet --upgrade pip
-  elif command -v uv >/dev/null; then
-    echo "[+] no python3 >= 3.12 on PATH; creating venv with uv-managed Python 3.12"
-    uv venv --quiet --python 3.12 --seed "$VENV"
-  else
-    echo "[x] need python3 >= 3.12 (or uv: https://docs.astral.sh/uv/)" >&2; exit 1
-  fi
-fi
-echo "[+] installing $(grep -v '^#' "$HERE/requirements.txt" | tr '\n' ' ')"
-"$VENV/bin/python" -m pip install --quiet -r "$HERE/requirements.txt"
+pyenv_ensure "$HERE"
 OPENHANDS_SUPPRESS_BANNER=1 "$VENV/bin/python" -c '
 import importlib.metadata as m
 from openhands.tools.terminal import TerminalTool

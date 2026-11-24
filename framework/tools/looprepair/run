@@ -68,11 +68,11 @@ import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FW_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-VENV = os.path.join(HERE, ".venv")
 UPSTREAM_SRC = os.path.join(HERE, "upstream", "src", "looprepair")
 sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
 import aprsandbox as sb  # noqa: E402
 import flcommon as fl  # noqa: E402
+import venvcheck  # noqa: E402
 
 COVER_SH = r"""
 set -u
@@ -585,10 +585,9 @@ def main():
     ap.add_argument("--replay", action="store_true", help="no LLM: pipeline self-test")
     args = ap.parse_args()
 
-    if not os.access(os.path.join(VENV, "bin", "python"), os.X_OK) or not os.path.isdir(UPSTREAM_SRC):
+    if not os.path.isdir(UPSTREAM_SRC):
         raise SystemExit(f"looprepair not prepared — run {HERE}/prepare.sh (cvebench prepare -t looprepair)")
-    if os.path.realpath(sys.prefix) != os.path.realpath(VENV):  # re-exec inside the venv
-        os.execv(os.path.join(VENV, "bin", "python"), [os.path.join(VENV, "bin", "python"), os.path.abspath(__file__)] + sys.argv[1:])
+    venvcheck.reexec(HERE, __file__)        # re-exec inside the venv (exits unless it is prepared)
     args.results, args.workdir = os.path.abspath(args.results), os.path.abspath(args.workdir)  # before chdir below
     if not os.path.exists(os.path.join(args.results, "tests.json")):
         raise SystemExit("no coverage for this bug — run `cvebench coverage` first (re-localization uses it)")
