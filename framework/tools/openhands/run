@@ -56,7 +56,6 @@ sys.path.insert(0, os.path.join(FW_ROOT, "lib"))
 import aprsandbox as sb  # noqa: E402
 import venvcheck  # noqa: E402
 
-SANDBOX_PATH = "/cvebench/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # canned reply when the agent talks instead of acting (OpenHands benchmarks, utils/fake_user_response.py)
 FAKE_USER = ("Please continue working on the task on whatever approach you think is suitable.\n"
@@ -76,8 +75,9 @@ def copy_tree(image, src, dest_parent):
     return os.path.join(dest_parent, os.path.basename(src))
 
 
-def sandbox_env(tree):
-    return ["-e", "HOME=/tmp", "-e", f"PATH={SANDBOX_PATH}", "-e", f"HAPROXY_SRC={tree}",
+def sandbox_env(bug, tree):
+    extra = [x for k, v in bug.env(tree).items() for x in ("-e", f"{k}={v}")]  # HAPROXY_SRC, or Go's
+    return ["-e", "HOME=/tmp", "-e", f"PATH={sb.SANDBOX_PATH}", *extra,
             "-e", "PAGER=cat", "-e", "GIT_PAGER=cat", "-e", "TERM=xterm-256color",
             "-e", "INPUTRC=/cvebench/inputrc"]  # no bracketed-paste escapes in the terminal output
 
@@ -163,7 +163,8 @@ def main():
     if not model_name:
         raise SystemExit("no model: set LLM_MODEL (litellm name) or LLM_BASE_URL / OPENAI_BASE_URL")
     api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ("none" if args.base_url else None)
-    instruction_t = string.Template(open(os.path.join(HERE, "instruction.txt")).read())
+    instruction_t = string.Template(open(os.path.join(
+        HERE, "instruction_go.txt" if bug.lang == "go" else "instruction.txt")).read())
 
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(os.path.join(out_dir, "candidates"), exist_ok=True)
@@ -197,15 +198,15 @@ def main():
             tree = copy_tree(bug.image, bug.src, tmp)
             cid = subprocess.run(
                 ["docker", "run", "-d", "--rm", "--name", f"cvebench-oh-{uuid.uuid4().hex[:8]}", *sb.DOCKER_ARGS,
-                 "-v", f"{tree}:{tree}", "-v", f"{sbx}:/cvebench:ro", "-w", tree, *sandbox_env(tree),
+                 "-v", f"{tree}:{tree}", "-v", f"{sbx}:/cvebench:ro", "-w", tree, *sandbox_env(bug, tree),
                  bug.image, "sleep", f"{args.time_limit + 900}s"],
                 capture_output=True, text=True, check=True).stdout.strip()
             r = sb.sh(["docker", "exec", cid, "bash", "-c", sb.setup_cmd(tree, also=[bug.src])])
             if r.returncode != 0:
                 raise SystemExit(f"sandbox setup failed: {r.stdout}{r.stderr}")
-            failure = sb.sh(["docker", "exec", "--user", uid, *sandbox_env(tree), cid, "bash", "-c",
+            failure = sb.sh(["docker", "exec", "--user", uid, *sandbox_env(bug, tree), cid, "bash", "-c",
                              "cvebench-test trigger"], timeout=600).stdout
-            task = sb.bug_report(trig, failure, args.results, args.fl, args.fl_top)
+            task = sb.bug_report(trig, failure, args.results, args.fl, args.fl_top, bug=bug)
             instruction = instruction_t.substitute(repo_path=tree, bug_report=task)
             with open(os.path.join(rdir, "instruction.txt"), "w") as fh:
                 fh.write(instruction)
@@ -216,7 +217,7 @@ def main():
                 fh.write("#!/usr/bin/env bash\n# OpenHands terminal backend: interactive bash in the cvebench sandbox\n"
                          "# (a wide PTY, so long commands are not wrapped and their echo can be stripped)\n"
                          "stty cols 4096 rows 60 2>/dev/null\n"
-                         f"exec docker exec -i -t --user {uid} {' '.join(sandbox_env(tree))} -w {tree} {cid} bash \"$@\"\n")
+                         f"exec docker exec -i -t --user {uid} {' '.join(sandbox_env(bug, tree))} -w {tree} {cid} bash \"$@\"\n")
             os.chmod(shell, 0o755)
 
             if replay:
@@ -297,7 +298,7 @@ def main():
                 except Exception as e:
                     print(f"[openhands] {rid}: could not save the trajectory: {e}", flush=True)
                 conv.close()
-            files, diff = sb.export_patch(cid, tree, args.workdir, cand)
+            files, diff = sb.export_patch(cid, tree, args.workdir, cand, bug=bug)
         finally:
             if cid:
                 subprocess.run(["docker", "rm", "-f", cid], capture_output=True)

@@ -424,10 +424,12 @@ Reference implementations:
   command it issues runs in a sandbox container started from the bug's
   **buggy image** (`cvebench:<pid>-<bid>-buggy`, see 5.7), where the tree is
   already built with the benchmark's flags and helper commands
-  `cvebench-build` / `cvebench-test [trigger|all|<vtc>]` give cheap
-  intermediate feedback. At the end the changed `src/`/`include/` C files are
-  copied onto a copy of `<workdir>` and exported with `cvebench diff` — one
-  candidate per run (`--runs R`). Trajectories are kept under `runs/run<k>/`,
+  `cvebench-build` / `cvebench-test [trigger|all|<test>]` give cheap
+  intermediate feedback (HAProxy: incremental `make`, vtest; Kubernetes: `go build`
+  / `go test -json` per package on the image's warm Go build cache). At the end the
+  changed sources (HAProxy: `src/`/`include/` C files; Go: non-test `*.go` outside
+  `vendor/`) are copied onto a copy of `<workdir>` and exported with `cvebench diff`
+  — one candidate per run (`--runs R`). The prompt has a C and a Go variant. Trajectories are kept under `runs/run<k>/`,
   per-run status/steps/time in `miniswe.json`. `-- --replay
   framework/tools/miniswe/selftest.cmds` drives the same loop from scripted
   commands instead of an LLM — a pipeline check that must yield one candidate
@@ -452,7 +454,16 @@ Reference implementations:
   the fault space is capped to the `--max-lines` lines Darjeeling's own metric
   ranks highest (it enumerates every edit at every localized line before
   searching), and files it cannot process (not UTF-8; Kaskara's clang indexer
-  crashes) are excluded (`excluded-files.json`).
+  crashes) are excluded (`excluded-files.json`). Go (Kubernetes) has no Kaskara
+  backend, so it uses Darjeeling's language-independent line operators
+  (delete / replace / insert line, `language: text`): the program image holds the
+  overlay trigger tests and runs one Go test per command (`go test -c` binaries,
+  `/cvebench/run-test <pkg> <test>`), and test-helper packages (`testing/`,
+  `fake/`, `testutil/`) are excluded from the fault space. The pinned Darjeeling
+  cannot use its line operators as shipped (an abstract `line` property shadows
+  the attrs field), so `run` starts it through a small wrapper that fixes that
+  and turns an exception inside a candidate evaluation, which Darjeeling would
+  otherwise wait on forever, into an error.
 
 * `framework/tools/looprepair/` — a **published tool one of whose stages cannot
   run on the benchmark** (LoopRepair, ICSE 2026). The part that can — its LLM
@@ -481,7 +492,9 @@ Reference implementations:
   through a small launcher (`mlrun.py`) that applies two run-time substitutions for
   local models: an output-token floor (a reasoning model's thinking counts against
   `max_tokens`) and an embeddings client for any OpenAI-compatible endpoint. Every
-  distinct sample patch is a candidate; upstream's own selection is recorded.
+  distinct sample patch is a candidate; upstream's own selection is recorded. For Go
+  (Kubernetes) the repository it sees is the failing tests' in-repo import closure
+  (`go list -deps -test`, no `vendor/`), since the whole tree does not fit the context.
 
 * `framework/tools/fangelix/` — a **semantics-based tool distributed as a Docker
   image** (FAngelix, an Angelix extension; LLVM 2.9/3.7, KLEE, Z3 toolchain). It runs
@@ -503,9 +516,10 @@ helper commands, `setup_cmd` (hides the answer, 5.7), `bug_report`,
 ### 5.7 Sandboxing agents and hiding the answer
 
 Agents that execute commands should do so in a container of the bug's buggy
-image rather than on the host: it has the toolchain and `vtest`, keeps the
-agent away from the host, and is the software-under-test image (so it does
-not violate rule 6.2). When doing so, remove what would reveal the fix:
+image rather than on the host: it has the toolchain (and `vtest`, or a warm Go
+build cache), keeps the agent away from the host, and is the software-under-test
+image (so it does not violate rule 6.2). When doing so, remove what would reveal
+the fix:
 
 * `/tmp/fix.patch` — the upstream fix the image build reverse-applied;
 * `CHANGELOG` of the fixed release (it lists the fix commit's subject);
@@ -518,8 +532,9 @@ not violate rule 6.2). When doing so, remove what would reveal the fix:
   agent works on a copy (OpenHands) must also clean the image's own `/build` tree
   (`aprsandbox.setup_cmd(tree, also=[bug.src])`);
 * network access (`docker run --network none`) — upstream sources are online;
-* the crafted trigger tests' `#` comments (they describe buggy vs fixed
-  behaviour and sometimes name the fixed function) and CVE identifiers.
+* the crafted trigger tests' comments (`#` in .vtc, `//` in Go; they describe
+  buggy vs fixed behaviour and sometimes name the fixed function) and CVE
+  identifiers. Kubernetes' fixed-release `CHANGELOG/` directory goes too.
 
 The release version (`VERSION`) cannot be hidden without changing the build;
 results of LLM-based tools on these public CVEs may still be influenced by
@@ -619,7 +634,10 @@ for crash-driven techniques.
   in its own goroutine (the images' Go `testing` package writes the profile
   before re-panicking, `build/cover-on-panic.py`); a panic elsewhere, or a test
   timeout, loses that test's coverage and the test is excluded.
-* The external FL / APR tools under `framework/tools/` other than `flitsr`,
-  `autofl`, `cosmosfl` and `oracle` are still HAProxy-specific (vtest, gcov, `make`,
-  C parsers); the core harness (`checkout … validate`, `coverage`, built-in SBFL)
-  supports both projects.
+* Tools that support both projects: `flitsr`, `autofl`, `cosmosfl`, `oracle` and the
+  agent / LLM APR tools `miniswe`, `liveswe`, `openhands`, `magentless` (the APR
+  sandbox, `framework/lib/aprsandbox.py`, has a C and a Go variant), and `darjeeling`
+  (C: Kaskara statement operators; Go: line operators). C-only by design:
+  `mbfl` (Mull), `llmao` (C model), `looprepair`
+  (tree-sitter-c functions, gcov traces) and `fangelix` (Angelix). The core harness
+  (`checkout … validate`, `coverage`, built-in SBFL) supports both projects.

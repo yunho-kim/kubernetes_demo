@@ -30,7 +30,10 @@ Inputs, in upstream's formats, under <out-dir>/ws/:
                                comments stripped, CVE ids redacted, + its failure output,
                                obtained by running it once in the bug's buggy image)
   structure/<id>.json          upstream create_structure() of the buggy source tree
-                               (PROJECT_FILE_LOC; upstream would clone the repo instead)
+                               (PROJECT_FILE_LOC; upstream would clone the repo instead).
+                               Go (Kubernetes): only the failing tests' in-repo import
+                               closure (go list -deps -test, no vendor/, non-test files):
+                               the whole tree (~11k Go files) does not fit the context.
 Outputs: every distinct non-empty sample patch, re-exported with `cvebench diff`, is a
 candidate (candidates/s<set>_<k>.patch); magentless.json records the localized files,
 which samples produced each candidate and which one upstream's selection picked.
@@ -63,9 +66,37 @@ LANG_OF = {"haproxy": "c", "kubernetes": "go"}
 def trigger_failure(bug, sbx):
     """Run the failing test once in the buggy image (no network; the answer hidden as for agents)."""
     r = sb.sh(["docker", "run", "--rm", *sb.DOCKER_ARGS, "-v", f"{sbx}:/cvebench:ro", "-w", bug.src,
-               "-e", "PATH=/cvebench/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+               "-e", f"PATH={sb.SANDBOX_PATH}",
                bug.image, "bash", "-c", sb.setup_cmd(bug.src) + " && cvebench-test trigger"], timeout=900)
     return (r.stdout + r.stderr).strip()
+
+
+def go_scope(bug, workdir, tree, dest):
+    """Go: the repository Agentless sees = the in-repo packages the failing tests import
+    (`go list -deps -test` of the trigger test packages, outside vendor/), non-test .go files
+    only. The whole Kubernetes tree (~11k non-test Go files) does not fit a model's context.
+    Copies those files from <workdir>/<tree> to <dest>/<tree>; returns (n_dirs, n_files)."""
+    tdir = os.path.join(bug.pdir, "tests", bug.bid)
+    pkgs = sorted({l.split("::")[0].strip() for l in open(os.path.join(tdir, "trigger.txt"))
+                   if l.strip() and not l.startswith("#")})
+    fmt = "{{if not .Standard}}{{.Dir}}{{end}}"
+    r = sb.sh(["docker", "run", "--rm", "--network", "none", "-w", bug.src, bug.image,
+               "go", "list", "-deps", "-test", "-f", fmt, *[f"./{p}" for p in pkgs]], timeout=1800)
+    if r.returncode != 0:
+        raise SystemExit(f"go list failed: {r.stderr[-1500:]}")
+    dirs = sorted({os.path.relpath(d, bug.src) for d in r.stdout.split()
+                   if d.startswith(bug.src + "/") and "/vendor/" not in d + "/"})
+    n = 0
+    for d in dirs:
+        src_d = os.path.join(workdir, tree, d)
+        if not os.path.isdir(src_d):
+            continue
+        for f in os.listdir(src_d):
+            if f.endswith(".go") and not f.endswith("_test.go") and os.path.isfile(os.path.join(src_d, f)):
+                os.makedirs(os.path.join(dest, tree, d), exist_ok=True)
+                shutil.copy2(os.path.join(src_d, f), os.path.join(dest, tree, d, f))
+                n += 1
+    return len(dirs), n
 
 
 def nltk_data_dir():
@@ -134,8 +165,6 @@ def main():
     model = args.model or sb.default_model(args.base_url, prefix="")
 
     bug = sb.Bug(args.workdir)
-    if bug.pid not in ("haproxy",):
-        raise SystemExit(f"magentless: {bug.pid} not supported yet (the bug report comes from the HAProxy APR sandbox)")
     lang = LANG_OF[bug.pid]
     bug.ensure_image("magentless")
     out_dir = os.path.abspath(args.out_dir)
@@ -155,10 +184,10 @@ def main():
     if not os.path.exists(task_p):
         sbx = os.path.join(out_dir, "sandbox")
         trig = sb.write_helpers(bug, sbx, keep_comments=args.keep_comments, redact=not args.no_redact)
-        task = sb.bug_report(trig, trigger_failure(bug, sbx))
+        task = sb.bug_report(trig, trigger_failure(bug, sbx), bug=bug)
         open(task_p, "w").write(task)
     task = open(task_p).read()
-    title = f"{bug.pid}: a regression test fails"
+    title = f"{bug.pid}: {'Go tests fail' if lang == 'go' else 'a regression test fails'}"
     inst = {"org": bug.pid, "repo": bug.pid, "instance_id": iid, "base": {"sha": bug.version},
             "resolved_issues": [{"title": title, "body": task}]}
     with open(os.path.join(ws, "data", lang, "cvebench.jsonl"), "w") as fh:
@@ -166,12 +195,23 @@ def main():
 
     # ---- repository structure of the buggy tree (upstream's parser)
     struct_p = os.path.join(ws, "structure", f"{iid}.json")
+    scope_p = os.path.join(ws, "scope.json")
     if not os.path.exists(struct_p):
+        root = args.workdir
+        if lang == "go":   # the failing tests' in-repo import closure (go_scope)
+            root = os.path.join(ws, "scope")
+            if os.path.isdir(root):
+                shutil.rmtree(root)
+            nd, nf = go_scope(bug, args.workdir, tree, root)
+            json.dump({"rule": "go list -deps -test of the trigger test packages, outside vendor/, non-test .go",
+                       "packages": nd, "files": nf}, open(scope_p, "w"), indent=2)
+            print(f"[magentless] {bug.name}: repository scope = {nd} packages, {nf} non-test Go files "
+                  "(the failing tests' in-repo imports)", flush=True)
         code = ("import json, sys; from get_repo_structure.get_repo_structure import create_structure; "
                 "s = create_structure(sys.argv[1]); "
                 "json.dump({'repo': sys.argv[2], 'base_commit': sys.argv[3], 'structure': s, 'instance_id': sys.argv[4]}, "
                 "open(sys.argv[5], 'w'))")
-        r = subprocess.run([VENV_PY, "-c", code, os.path.join(args.workdir, tree), f"{bug.pid}/{bug.pid}",
+        r = subprocess.run([VENV_PY, "-c", code, os.path.join(root, tree), f"{bug.pid}/{bug.pid}",
                             bug.version, iid, struct_p], cwd=UP, env={**os.environ, "SWEBENCH_LANG": lang},
                            capture_output=True, text=True)
         if r.returncode != 0:
@@ -286,6 +326,7 @@ def main():
     summary = {
         "model": model, "sets": args.sets, "samples": args.samples,
         "retrieval": None if args.no_retrieval else {"embed_url": args.embed_url, "embed_model": args.embed_model},
+        "repository_scope": json.load(open(scope_p)) if os.path.exists(scope_p) else "whole source tree",
         "min_tokens": args.min_tokens,
         "found_files": first(f"{R}/file_level/loc_outputs.jsonl", "found_files"),
         "combined_files": None if args.no_retrieval else first(f"{R}/file_level_combined/combined_locs.jsonl", "found_files"),

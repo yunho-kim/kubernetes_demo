@@ -595,6 +595,8 @@ def main():
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(os.path.join(out_dir, "work"), exist_ok=True)
     bug = sb.Bug(args.workdir)
+    if bug.lang != "c":
+        raise SystemExit(f"looprepair: C programs only (its LLM stage extracts C functions with tree-sitter-c and ranks by gcov traces); {bug.name} is {bug.lang}")
     bug.ensure_image("looprepair")
     model = "replay" if args.replay else args.model or (
         sb.default_model(args.base_url, prefix="") if args.base_url else "gpt-4o-mini")
