@@ -18,18 +18,22 @@ LLM endpoint: any model litellm supports. For an OpenAI-compatible server set
 
 Pipeline, per run k = 1..R
   1. sandbox: a container of the bug's buggy image (cvebench:<pid>-<bid>-buggy — the
-     source tree already built with the benchmark's flags, vtest installed), started
-     with --network none; the upstream fix patch and CHANGELOG are deleted from it
-     first. Helper commands cvebench-build / cvebench-test (mounted read-only at
-     /cvebench) rebuild incrementally and run the trigger / relevant tests.
-  2. bug report = the failing test (# comment lines removed, CVE identifiers redacted)
-     + its failure output
+     source tree already built with the benchmark's flags; HAProxy: vtest installed,
+     Kubernetes: warm Go build cache), started with --network none; the upstream fix
+     patch, the CHANGELOG and patch backups are deleted from it first. Helper commands
+     cvebench-build / cvebench-test (mounted read-only at /cvebench; aprsandbox) rebuild
+     incrementally and run the trigger / relevant tests (vtest, or go test).
+  2. bug report = the failing test(s) (comment lines removed, CVE identifiers redacted;
+     for Go the test function or table entry) + the failure output
      (run in the sandbox) [+ the top lines of an FL ranking with --fl].
   3. mini-swe-agent's DefaultAgent runs bash commands in the sandbox until it submits
-     or hits the step / time limit; trajectory -> runs/run<k>/trajectory.json.
-  4. the *.c / *.h files under src/ and include/ it created or changed are copied
-     onto a copy of <workdir> and exported with `cvebench diff`
-     -> candidates/run<k>.patch (runs that changed nothing produce no candidate).
+     or hits the step / time limit; trajectory -> runs/run<k>/trajectory.json. The
+     prompt (config.yaml) has a C (HAProxy) and a Go (Kubernetes) variant.
+  4. the source files it created or changed (HAProxy: *.c / *.h under src/ and include/;
+     Go: non-test *.go outside vendor/) are copied onto a copy of <workdir> and exported
+     with `cvebench diff` -> candidates/run<k>.patch (runs that changed nothing produce
+     no candidate). Self-tests without an LLM: --replay selftest.cmds (HAProxy),
+     --replay selftest-go.cmds (Kubernetes).
 The harness (cvebench apr) then validates every candidate in a clean image.
 """
 import argparse
@@ -139,7 +143,7 @@ def main():
             if r["returncode"] != 0:
                 raise SystemExit(f"sandbox setup failed: {r['output']}")
             failure = env.execute({"command": "cvebench-test trigger"}, timeout=600)["output"]
-            task = sb.bug_report(trig, failure, args.results, args.fl, args.fl_top)
+            task = sb.bug_report(trig, failure, args.results, args.fl, args.fl_top, bug=bug)
             open(os.path.join(rdir, "task.txt"), "w").write(task)
             if replay:
                 from minisweagent.models.test_models import DeterministicModel, make_output
@@ -156,11 +160,11 @@ def main():
             print(f"[{tag}] {pid}-{bid} {rid}: agent start ({model_name}, {args.protocol}, "
                   f"≤{args.step_limit} steps, ≤{args.time_limit}s)", flush=True)
             try:
-                res = agent.run(task, src=src, protocol=args.protocol)
+                res = agent.run(task, src=src, protocol=args.protocol, lang=bug.lang, project=bug.project)
                 status = res.get("exit_status", "")
             except Exception as e:  # model/server errors end the run; the edits so far are still exported
                 status = f"error: {type(e).__name__}: {e}"
-            files, diff = sb.export_patch(env.container_id, src, args.workdir, cand)
+            files, diff = sb.export_patch(env.container_id, src, args.workdir, cand, bug=bug)
         finally:
             env.cleanup()
         n = sb.patch_lines(diff)

@@ -1,0 +1,6 @@
+# Pipeline self-test for Go bugs (`run --replay selftest-go.cmds`, no LLM): look around, make a
+# harmless edit to a non-test file of the first suite package, run the trigger, submit.
+# Expected: one candidate that compiles and is NOT plausible (the trigger still fails).
+ls /cvebench /cvebench/bin && test ! -e /tmp/fix.patch && test ! -e CHANGELOG && echo hidden-ok
+f=$(ls $(head -1 /cvebench/test_pkgs.txt)/*.go | grep -v _test.go | head -1) && printf '\n// cvebench miniswe self-test edit\n' >> "$f" && echo "edited $f"
+cvebench-test trigger; true
